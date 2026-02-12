@@ -32,6 +32,7 @@ class BetmanScraper:
     def __init__(self, config: Config) -> None:
         self._config = config
         self._captured_responses: list[dict[str, Any]] = []
+        self.current_round: str = ""  # e.g. "19" — set during navigation
 
     async def scrape_purchase_history(self, page: Page) -> list[BetSlip]:
         """Main entry: navigate to purchase history and return BetSlips with purchase statuses."""
@@ -127,9 +128,23 @@ class BetmanScraper:
         current_url = page.url
         if not current_url or "betman.co.kr" not in current_url:
             await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_load_state("networkidle", timeout=15000)
+
+        # Always wait for networkidle — is_logged_in only waits for domcontentloaded
+        await page.wait_for_load_state("networkidle", timeout=15000)
 
         await self._dismiss_popups(page)
+
+        # Grab current round from main page before navigating away
+        try:
+            title_el = page.locator("#mainProtoTitle")
+            if await title_el.count() > 0:
+                title_text = (await title_el.text_content() or "").strip()
+                round_match = re.search(r"(\d+)회차", title_text)
+                if round_match:
+                    self.current_round = round_match.group(1)
+                    logger.info("Current round from main page: %s (%s)", self.current_round, title_text)
+        except Exception as exc:
+            logger.debug("Failed to get current round from main page: %s", exc)
 
         # Strategy 1: Click "구매/적중내역" link from header (most reliable)
         buy_link_selectors = [

@@ -12,7 +12,6 @@ from discord import TextStyle, app_commands
 from discord.ext import commands
 
 from src.models import BetSlip, GameSchedule
-from src.scraper import _PURCHASE_STATUSES
 
 if TYPE_CHECKING:
     from src.database import Database
@@ -338,7 +337,7 @@ async def _purchases_command(
             return
 
     try:
-        slips = await bot.scrape_callback(discord_user_id)
+        slips, current_round = await bot.scrape_callback(discord_user_id)
         if not slips:
             await interaction.followup.send("구매내역이 없습니다.")
             return
@@ -362,18 +361,16 @@ async def _purchases_command(
             slips = filtered
             header = f"**최근 1시간 구매내역 {len(slips)}건**"
         elif filter == "active":
-            active_rounds = {
-                (s.game_type, s.round_number)
-                for s in slips
-                if s.status in _PURCHASE_STATUSES
-            }
-            if active_rounds:
-                slips = [s for s in slips if (s.game_type, s.round_number) in active_rounds]
-                round_desc = ", ".join(f"{gt} {rn}회차" for gt, rn in sorted(active_rounds))
-                header = f"**{round_desc}** 구매내역 {len(slips)}건"
+            # Filter by current round number from main page
+            if current_round:
+                round_slips = [s for s in slips if s.round_number == current_round]
+                if round_slips:
+                    slips = round_slips
+                    header = f"**{current_round}회차** 구매내역 {len(slips)}건"
+                else:
+                    header = f"**구매내역 {len(slips)}건 조회 완료** ({current_round}회차 구매 없음)"
             else:
-                await interaction.followup.send("현재 진행중인 회차가 없습니다.")
-                return
+                header = f"**구매내역 {len(slips)}건 조회 완료**"
         else:
             header = f"**구매내역 {len(slips)}건 조회 완료**"
 
@@ -498,7 +495,7 @@ def _build_embed(slip: BetSlip) -> discord.Embed:
     colour = _STATUS_COLOURS.get(slip.status, discord.Colour.blurple())
 
     embed = discord.Embed(
-        title=f"{slip.game_type} {slip.round_number}회차" if slip.round_number else slip.title,
+        title=f"{slip.game_type} {slip.round_number}" + ("" if "회" in slip.round_number else "회차") if slip.round_number else slip.title,
         colour=colour,
     )
     embed.add_field(name="상태", value=slip.status, inline=True)
