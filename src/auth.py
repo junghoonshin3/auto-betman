@@ -84,7 +84,7 @@ class BetmanAuth:
     async def is_logged_in(self, page: Page) -> bool:
         """Check login status by navigating to main page and looking for auth indicators."""
         try:
-            await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
+            await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=90000)
 
             # Wait for the JS variable to be defined (fastest check)
             try:
@@ -117,7 +117,7 @@ class BetmanAuth:
 
             return False
         except Exception as exc:
-            logger.debug("Login check failed: %s", exc)
+            logger.warning("Login check failed (goto may have timed out): %s", exc)
             return False
 
     async def login(
@@ -137,8 +137,12 @@ class BetmanAuth:
             raise RuntimeError("Betman credentials not provided")
 
         logger.info("Starting login flow …")
-        await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_load_state("networkidle", timeout=15000)
+        current_url = page.url or ""
+        if "betman.co.kr" not in current_url:
+            await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=90000)
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        else:
+            logger.info("Already on betman.co.kr, skipping redundant goto")
 
         # Save main page HTML for debugging
         debug_dir = Path("storage")
@@ -195,7 +199,7 @@ class BetmanAuth:
                     await page.goto(
                         f"{self._config.base_url}{url_path}",
                         wait_until="domcontentloaded",
-                        timeout=60000,
+                        timeout=90000,
                     )
                     await page.wait_for_load_state("networkidle", timeout=10000)
                     if await page.locator(".errorArea").count() > 0:
