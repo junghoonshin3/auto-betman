@@ -52,7 +52,7 @@ _LOGIN_BTN_SELECTORS = [
 ]
 
 
-async def _try_selectors(page: Page, selectors: list[str], *, timeout: int = 3000) -> str | None:
+async def _try_selectors(page: Page, selectors: list[str], *, timeout: int = 8000) -> str | None:
     """Return the first selector that matches a visible element, or None."""
     for sel in selectors:
         try:
@@ -64,7 +64,7 @@ async def _try_selectors(page: Page, selectors: list[str], *, timeout: int = 300
     return None
 
 
-async def _try_selectors_in_frame(frame, selectors: list[str], *, timeout: int = 3000) -> str | None:
+async def _try_selectors_in_frame(frame, selectors: list[str], *, timeout: int = 8000) -> str | None:
     """Like _try_selectors but works on a Frame object."""
     for sel in selectors:
         try:
@@ -84,8 +84,8 @@ class BetmanAuth:
     async def is_logged_in(self, page: Page) -> bool:
         """Check login status by navigating to main page and looking for auth indicators."""
         try:
-            await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=15000)
-            await page.wait_for_timeout(1500)
+            await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)
 
             # Check for logged-in indicators on main page
             logged_in_selectors = [
@@ -96,7 +96,7 @@ class BetmanAuth:
             ]
             for sel in logged_in_selectors:
                 try:
-                    if await page.locator(sel).first.is_visible(timeout=2000):
+                    if await page.locator(sel).first.is_visible(timeout=5000):
                         logger.debug("Logged-in indicator found: %s", sel)
                         return True
                 except Exception:
@@ -130,8 +130,8 @@ class BetmanAuth:
             raise RuntimeError("Betman credentials not provided")
 
         logger.info("Starting login flow …")
-        await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=20000)
-        await page.wait_for_timeout(2000)
+        await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(4000)
 
         # Save main page HTML for debugging
         debug_dir = Path("storage")
@@ -152,9 +152,9 @@ class BetmanAuth:
         logger.info("Opening login modal via openLoginPop() …")
         try:
             await page.evaluate("openLoginPop()")
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(5000)
             # The modal loads login form into the page DOM
-            id_sel = await _try_selectors(page, _USER_ID_SELECTORS, timeout=5000)
+            id_sel = await _try_selectors(page, _USER_ID_SELECTORS, timeout=10000)
             if id_sel:
                 logger.info("Login form found in modal")
         except Exception as exc:
@@ -162,12 +162,12 @@ class BetmanAuth:
 
         # Strategy 2: Click login link (may trigger modal or popup)
         if not id_sel:
-            link_sel = await _try_selectors(page, _LOGIN_LINK_SELECTORS, timeout=3000)
+            link_sel = await _try_selectors(page, _LOGIN_LINK_SELECTORS, timeout=8000)
             if link_sel:
                 logger.info("Clicking login link: %s", link_sel)
                 await page.locator(link_sel).first.click()
-                await page.wait_for_timeout(3000)
-                id_sel = await _try_selectors(page, _USER_ID_SELECTORS, timeout=5000)
+                await page.wait_for_timeout(5000)
+                id_sel = await _try_selectors(page, _USER_ID_SELECTORS, timeout=10000)
                 if id_sel:
                     logger.info("Login form found after clicking link")
 
@@ -176,7 +176,7 @@ class BetmanAuth:
             for frame in page.frames:
                 if frame == page.main_frame:
                     continue
-                id_sel = await _try_selectors_in_frame(frame, _USER_ID_SELECTORS, timeout=3000)
+                id_sel = await _try_selectors_in_frame(frame, _USER_ID_SELECTORS, timeout=8000)
                 if id_sel:
                     login_frame = frame
                     logger.info("Login form found in iframe: %s", frame.url)
@@ -190,14 +190,14 @@ class BetmanAuth:
                     await page.goto(
                         f"{self._config.base_url}{url_path}",
                         wait_until="domcontentloaded",
-                        timeout=15000,
+                        timeout=60000,
                     )
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(4000)
                     if await page.locator(".errorArea").count() > 0:
                         logger.info("URL %s returned error page, skipping", url_path)
                         continue
                     login_target = page
-                    id_sel = await _try_selectors(page, _USER_ID_SELECTORS, timeout=5000)
+                    id_sel = await _try_selectors(page, _USER_ID_SELECTORS, timeout=10000)
                     if id_sel:
                         logger.info("Login form found at direct URL: %s", url_path)
                         break
@@ -218,21 +218,21 @@ class BetmanAuth:
         logger.info("User ID filled")
 
         # Fill PW
-        pw_sel = await _try_selectors(form_target, _USER_PW_SELECTORS, timeout=5000)
+        pw_sel = await _try_selectors(form_target, _USER_PW_SELECTORS, timeout=10000)
         if not pw_sel:
             raise RuntimeError("Cannot find password input field")
         await form_target.locator(pw_sel).first.fill(user_pw)
         logger.info("Password filled")
 
         # Click login button
-        btn_sel = await _try_selectors(form_target, _LOGIN_BTN_SELECTORS, timeout=5000)
+        btn_sel = await _try_selectors(form_target, _LOGIN_BTN_SELECTORS, timeout=10000)
         if not btn_sel:
             raise RuntimeError("Cannot find login button")
         await form_target.locator(btn_sel).first.click()
         logger.info("Login button clicked, waiting for response …")
 
         # Wait for login to process
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(5000)
 
         # Dismiss any post-login popups
         await self._dismiss_popups(page)
@@ -273,7 +273,7 @@ class BetmanAuth:
         for sel in popup_selectors:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=800):
+                if await loc.is_visible(timeout=2000):
                     await loc.click()
                     await page.wait_for_timeout(500)
             except Exception:

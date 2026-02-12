@@ -53,6 +53,8 @@ class BrowserManager:
             context_kwargs["storage_state"] = str(session_path)
 
         self._context = await self._browser.new_context(**context_kwargs)
+        self._context.set_default_timeout(60000)
+        self._context.set_default_navigation_timeout(60000)
         self._page = await self._context.new_page()
         await _stealth.apply_stealth_async(self._page)
 
@@ -126,6 +128,8 @@ class BrowserManager:
             context_kwargs["storage_state"] = str(session_path)
 
         context = await self._browser.new_context(**context_kwargs)
+        context.set_default_timeout(60000)
+        context.set_default_navigation_timeout(60000)
         page = await context.new_page()
         await _stealth.apply_stealth_async(page)
         return context, page

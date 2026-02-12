@@ -61,7 +61,7 @@ class BetmanScraper:
                         }
                     }
                 }""")
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(5000)
             except Exception as exc:
                 logger.debug("Failed to expand page size: %s", exc)
 
@@ -120,8 +120,8 @@ class BetmanScraper:
         # Ensure we're on the main page first (login check already navigates here)
         current_url = page.url
         if not current_url or "betman.co.kr" not in current_url:
-            await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=15000)
-            await page.wait_for_timeout(2000)
+            await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(4000)
 
         await self._dismiss_popups(page)
 
@@ -136,9 +136,9 @@ class BetmanScraper:
         for sel in buy_link_selectors:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=3000):
+                if await loc.is_visible(timeout=8000):
                     await loc.click()
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(5000)
                     if await page.locator(".errorArea").count() == 0:
                         logger.info("Navigated to purchase history via link: %s", page.url)
                         return
@@ -151,14 +151,14 @@ class BetmanScraper:
             try:
                 logger.info("Trying JS navigation to %s", path)
                 await page.evaluate(f"movePageUrl('{path}')")
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(5000)
                 if await page.locator(".errorArea").count() == 0:
                     logger.info("Navigated to purchase history via JS: %s", page.url)
                     return
                 logger.info("JS navigation to %s returned error page", path)
                 # Go back to main page for next attempt
-                await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=15000)
-                await page.wait_for_timeout(1500)
+                await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(3000)
             except Exception as exc:
                 logger.debug("JS navigation to %s failed: %s", path, exc)
                 continue
@@ -167,9 +167,9 @@ class BetmanScraper:
         for path in _PURCHASE_HISTORY_PATHS:
             url = f"{self._config.base_url}{path}"
             try:
-                resp = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 if resp and resp.ok:
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(4000)
                     if await page.locator(".errorArea").count() > 0:
                         logger.info("Direct path %s returned error page, skipping", path)
                         continue
@@ -358,7 +358,7 @@ class BetmanScraper:
         detail_params: dict = {}
         try:
             link = cells.nth(1).locator("a").first
-            href = await link.get_attribute("href", timeout=1000)
+            href = await link.get_attribute("href", timeout=5000)
             if href:
                 qs = parse_qs(urlparse(href).query)
                 detail_params = {
@@ -374,7 +374,7 @@ class BetmanScraper:
         if not detail_params.get("btkNum"):
             try:
                 btn = cells.nth(cell_count - 1).locator("a, button").first
-                onclick = await btn.get_attribute("onclick", timeout=1000)
+                onclick = await btn.get_attribute("onclick", timeout=5000)
                 if onclick:
                     # Extract params from onclick like openMarkingPaper('B30B-4867-2431-D450', ...)
                     params_match = re.findall(r"'([^']*)'", onclick)
@@ -458,7 +458,7 @@ class BetmanScraper:
                 result = await page.evaluate(
                     """(params) => {
                         return new Promise((resolve, reject) => {
-                            const timeout = setTimeout(() => reject('timeout'), 10000);
+                            const timeout = setTimeout(() => reject('timeout'), 30000);
                             try {
                                 if (typeof requestClient !== 'undefined' && requestClient.requestPostMethod) {
                                     requestClient.requestPostMethod(
@@ -672,8 +672,8 @@ class BetmanScraper:
         Returns (round_title, games).
         """
         # 1. Navigate to main page
-        await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=15000)
-        await page.wait_for_timeout(3000)
+        await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(5000)
         await self._dismiss_popups(page)
 
         # 2. Round title (e.g. "승부식 19회차")
@@ -695,14 +695,14 @@ class BetmanScraper:
                     logger.info("Found gameSlip.do link: %s", slip_url)
                     await page.evaluate(f"location.href = '{slip_url}'")
                     await page.wait_for_load_state("domcontentloaded")
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(5000)
                     await self._dismiss_popups(page)
 
                     # Check for error page
                     if await page.locator(".errorArea").count() > 0:
                         logger.warning("gameSlip.do returned error page, falling back to main page")
-                        await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=15000)
-                        await page.wait_for_timeout(3000)
+                        await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
+                        await page.wait_for_timeout(5000)
                         await self._dismiss_popups(page)
                     else:
                         navigated_to_slip = True
@@ -865,7 +865,7 @@ class BetmanScraper:
         for sel in ['button:has-text("확인")', 'button:has-text("닫기")', ".popup_close", ".layer_close"]:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=800):
+                if await loc.is_visible(timeout=2000):
                     await loc.click()
                     await page.wait_for_timeout(400)
             except Exception:
