@@ -55,10 +55,8 @@ class Orchestrator:
     # Per-user scrape helpers
     # ------------------------------------------------------------------
 
-    async def _scrape_for_user(self, user_row) -> tuple[list, str]:
-        """Scrape all history for a single registered user.
-        Returns (slips, current_round) where current_round is e.g. "19".
-        """
+    async def _scrape_for_user(self, user_row) -> list:
+        """Scrape all history for a single registered user."""
         discord_user_id = user_row["discord_user_id"]
         betman_user_id = user_row["betman_user_id"]
         betman_user_pw = user_row["betman_user_pw"]
@@ -68,7 +66,7 @@ class Orchestrator:
         try:
             await self.auth.ensure_logged_in(page, betman_user_id, betman_user_pw)
             slips = await self.scraper.scrape_all_history(page)
-            return slips, self.scraper.current_round
+            return slips
         finally:
             await self.browser_manager.close_user_context(context, session_path)
 
@@ -90,14 +88,12 @@ class Orchestrator:
         finally:
             await self.browser_manager.close_user_context(context, session_path)
 
-    async def run_scrape_cycle_for_user(self, discord_user_id: str) -> tuple[list, str]:
-        """Run a scrape cycle for a single user (called from slash commands).
-        Returns (slips, current_round).
-        """
+    async def run_scrape_cycle_for_user(self, discord_user_id: str) -> list:
+        """Run a scrape cycle for a single user (called from slash commands)."""
         user_row = await self.database.get_user(discord_user_id)
         if not user_row:
             logger.warning("User %s not registered", discord_user_id)
-            return [], ""
+            return []
         return await self._scrape_for_user(user_row)
 
     # ------------------------------------------------------------------
@@ -123,7 +119,7 @@ class Orchestrator:
         """Scrape + notify for a single user."""
         discord_user_id = user_row["discord_user_id"]
         try:
-            slips, _current_round = await self._scrape_for_user(user_row)
+            slips = await self._scrape_for_user(user_row)
 
             if not slips:
                 logger.info("No slips found for user %s", discord_user_id)

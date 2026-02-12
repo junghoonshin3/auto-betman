@@ -309,9 +309,9 @@ async def _setup_status(interaction: discord.Interaction) -> None:
 # ------------------------------------------------------------------
 
 @app_commands.command(name="purchases", description="구매내역을 상세하게 조회합니다 (경기/배당/선택 포함)")
-@app_commands.describe(filter="조회 범위 (기본: 발매중 회차)")
+@app_commands.describe(filter="조회 범위 (기본: 현재 회차 구매경기)")
 @app_commands.choices(filter=[
-    app_commands.Choice(name="진행중 회차 (기본)", value="active"),
+    app_commands.Choice(name="현재 회차 구매경기 (기본)", value="active"),
     app_commands.Choice(name="전체", value="all"),
     app_commands.Choice(name="최근 1시간", value="recent"),
 ])
@@ -337,7 +337,7 @@ async def _purchases_command(
             return
 
     try:
-        slips, current_round = await bot.scrape_callback(discord_user_id)
+        slips = await bot.scrape_callback(discord_user_id)
         if not slips:
             await interaction.followup.send("구매내역이 없습니다.")
             return
@@ -361,14 +361,12 @@ async def _purchases_command(
             slips = filtered
             header = f"**최근 1시간 구매내역 {len(slips)}건**"
         elif filter == "active":
-            # Filter by current round number from main page
-            if current_round:
-                round_slips = [s for s in slips if s.round_number == current_round]
-                if round_slips:
-                    slips = round_slips
-                    header = f"**{current_round}회차** 구매내역 {len(slips)}건"
-                else:
-                    header = f"**구매내역 {len(slips)}건 조회 완료** ({current_round}회차 구매 없음)"
+            # 가장 최신 회차 번호를 슬립에서 찾아서 필터링
+            rounds = [int(s.round_number) for s in slips if s.round_number.isdigit()]
+            if rounds:
+                latest = str(max(rounds))
+                slips = [s for s in slips if s.round_number == latest]
+                header = f"**{latest}회차 구매경기 {len(slips)}건**"
             else:
                 header = f"**구매내역 {len(slips)}건 조회 완료**"
         else:
