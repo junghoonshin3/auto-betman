@@ -160,6 +160,9 @@ class BetmanAuth:
         id_sel = None
         login_frame = None
 
+        # Clear any blocking popups before login attempt
+        await self._force_close_dialogs(page)
+
         logger.info("Opening login modal via openLoginPop() …")
         try:
             await page.evaluate("openLoginPop()")
@@ -170,15 +173,22 @@ class BetmanAuth:
         except Exception as exc:
             logger.info("openLoginPop() failed: %s", exc)
 
-        # Strategy 2: Click login link (may trigger modal or popup)
+        # Strategy 2: Click login link via JS (bypasses overlay)
         if not id_sel:
-            link_sel = await _try_selectors(page, _LOGIN_LINK_SELECTORS, timeout=3000)
-            if link_sel:
-                logger.info("Clicking login link: %s", link_sel)
-                await page.locator(link_sel).first.click()
+            await self._force_close_dialogs(page)
+            try:
+                logger.info("Clicking login link via JS …")
+                await page.evaluate("""() => {
+                    const link = document.querySelector('a[onclick*="openLoginPop"]');
+                    if (link) { link.click(); return; }
+                    const links = [...document.querySelectorAll('a')].filter(a => a.textContent.includes('로그인'));
+                    if (links.length > 0) links[0].click();
+                }""")
                 id_sel = await _try_selectors(page, _USER_ID_SELECTORS, timeout=10000)
                 if id_sel:
-                    logger.info("Login form found after clicking link")
+                    logger.info("Login form found after JS click")
+            except Exception as exc:
+                logger.info("JS login click failed: %s", exc)
 
         # Strategy 3: Search in iframes (login form may be in iframe)
         if not id_sel:
@@ -271,6 +281,16 @@ class BetmanAuth:
             return
         logger.info("Session expired or invalid, logging in …")
         await self.login(page, betman_user_id, betman_user_pw)
+
+    @staticmethod
+    async def _force_close_dialogs(page: Page) -> None:
+        """Force-remove all jQuery UI dialogs and overlays via JS."""
+        try:
+            await page.evaluate("""() => {
+                document.querySelectorAll('.ui-dialog, .ui-widget-overlay, .ui-dialog-overlay').forEach(el => el.remove());
+            }""")
+        except Exception:
+            pass
 
     @staticmethod
     async def _dismiss_popups(page: Page) -> None:
