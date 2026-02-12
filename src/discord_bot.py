@@ -47,6 +47,9 @@ class BetmanBot(commands.Bot):
         # Callback for /games command
         # Signature: async def callback(discord_user_id: str) -> tuple[str, list[GameSchedule]]
         self.games_callback = None
+        # Callback for /setup remove (session cleanup)
+        # Signature: async def callback(discord_user_id: str) -> None
+        self.remove_user_callback = None
 
     async def setup_hook(self) -> None:
         self.tree.add_command(_setup_group)
@@ -195,6 +198,16 @@ class BetmanBot(commands.Bot):
         if self._channel:
             await self._channel.send("현재 **발매중/발매마감** 상태의 구매내역이 없습니다.")
 
+    async def send_login_failed(self, discord_user_id: str, error: str) -> None:
+        """Notify user that login failed (wrong credentials)."""
+        embed = discord.Embed(
+            title="로그인 실패",
+            description="아이디 또는 비밀번호가 올바르지 않습니다.\n`/setup register`로 다시 등록해주세요.",
+            colour=discord.Colour.red(),
+        )
+        embed.set_footer(text=error)
+        await self._send_notification(discord_user_id, embed)
+
     # ------------------------------------------------------------------
     # Filter logic
     # ------------------------------------------------------------------
@@ -276,8 +289,19 @@ async def _setup_remove(interaction: discord.Interaction) -> None:
         )
         return
 
-    await bot.database.remove_user(str(interaction.user.id))
-    await interaction.response.send_message("등록이 해제되었습니다.", ephemeral=True)
+    discord_user_id = str(interaction.user.id)
+
+    # Delete session file
+    if bot.remove_user_callback:
+        try:
+            await bot.remove_user_callback(discord_user_id)
+        except Exception:
+            pass
+
+    await bot.database.remove_user(discord_user_id)
+    await interaction.response.send_message(
+        "등록이 해제되었습니다. (세션 정보도 삭제됨)", ephemeral=True
+    )
 
 
 @_setup_group.command(name="status", description="베트맨 계정 등록 상태를 확인합니다")

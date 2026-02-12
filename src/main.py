@@ -96,6 +96,13 @@ class Orchestrator:
             return []
         return await self._scrape_for_user(user_row)
 
+    async def remove_user_session(self, discord_user_id: str) -> None:
+        """Delete session file for a user (called from /setup remove)."""
+        session_path = STORAGE_DIR / f"session_{discord_user_id}.json"
+        if session_path.exists():
+            session_path.unlink()
+            logger.info("Deleted session file: %s", session_path)
+
     # ------------------------------------------------------------------
     # Core scrape cycle (multi-user)
     # ------------------------------------------------------------------
@@ -143,6 +150,12 @@ class Orchestrator:
             if unnotified_results:
                 await self.bot.send_results(unnotified_results, discord_user_id)
 
+        except RuntimeError as exc:
+            if "Login failed" in str(exc) or "Cannot find" in str(exc):
+                logger.error("Login failed for user %s: %s", discord_user_id, exc)
+                await self.bot.send_login_failed(discord_user_id, str(exc))
+            else:
+                logger.exception("Scrape cycle failed for user %s", discord_user_id)
         except Exception:
             logger.exception(
                 "Scrape cycle failed for user %s", discord_user_id
@@ -192,6 +205,7 @@ class Orchestrator:
         # Register callbacks for slash commands (per-user)
         self.bot.scrape_callback = self.run_scrape_cycle_for_user
         self.bot.games_callback = self.fetch_games_for_user
+        self.bot.remove_user_callback = self.remove_user_session
 
         # Start browser first
         await self.browser_manager.start()
