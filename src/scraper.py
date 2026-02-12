@@ -679,6 +679,23 @@ class BetmanScraper:
                 # Win status for this match
                 win_status = slip_paper.get("winStatus")
 
+                # Score and actual game result
+                score = sched.get("mchScore") or ""
+                game_result_code = sched.get("gameResult")
+                game_result = ""
+                if score and ":" in score:
+                    h, a = score.split(":")[:2]
+                    try:
+                        hi, ai = int(h), int(a)
+                        if hi > ai:
+                            game_result = "승"
+                        elif hi == ai:
+                            game_result = "무"
+                        else:
+                            game_result = "패"
+                    except ValueError:
+                        pass
+
                 matches.append(MatchBet(
                     match_number=match_seq,
                     sport=sport,
@@ -689,6 +706,8 @@ class BetmanScraper:
                     odds=odds,
                     match_datetime=match_dt,
                     result=win_status,
+                    score=score,
+                    game_result=game_result,
                 ))
             except Exception as exc:
                 logger.debug("Failed to parse match %d: %s", idx, exc)

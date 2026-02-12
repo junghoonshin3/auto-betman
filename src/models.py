@@ -13,13 +13,9 @@ class MatchBet:
     bet_selection: str
     odds: float
     match_datetime: str
-    result: str | None = None
-
-    def summary(self) -> str:
-        return (
-            f"[{self.league}] {self.home_team} vs {self.away_team} "
-            f"→ **{self.bet_selection}** (배당 {self.odds:.2f})"
-        )
+    result: str | None = None     # winStatus from API
+    score: str = ""               # e.g. "2:1"
+    game_result: str = ""         # "승"/"무"/"패" (actual result)
 
 
 @dataclass

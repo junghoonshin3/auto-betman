@@ -4,14 +4,6 @@ from src.models import BetSlip, MatchBet
 
 
 class TestMatchBet:
-    def test_summary(self, sample_match_bet: MatchBet):
-        result = sample_match_bet.summary()
-        assert "K리그1" in result
-        assert "전북현대" in result
-        assert "울산현대" in result
-        assert "홈승" in result
-        assert "2.10" in result
-
     def test_creation(self):
         m = MatchBet(
             match_number=3,

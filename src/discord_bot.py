@@ -499,7 +499,14 @@ def _build_summary_embed(header: str, slips: list[BetSlip]) -> discord.Embed:
         # 경기 목록 한 줄씩
         match_lines = []
         for m in slip.matches:
-            line = f"`{m.home_team}` vs `{m.away_team}` → **{m.bet_selection}** ({m.odds:.2f})"
+            if m.score:
+                # 경기 끝남 — 스코어 + 적중 여부
+                hit = m.bet_selection == m.game_result
+                icon = "✅" if hit else "❌"
+                line = f"{icon} `{m.home_team}` {m.score} `{m.away_team}` ({m.game_result}) | 선택: **{m.bet_selection}** ({m.odds:.2f})"
+            else:
+                # 경기 전
+                line = f"⏳ `{m.home_team}` vs `{m.away_team}` | 선택: **{m.bet_selection}** ({m.odds:.2f})"
             match_lines.append(line)
 
         if not match_lines:
