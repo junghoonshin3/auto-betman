@@ -375,10 +375,8 @@ async def _purchases_command(
         # 구매일시 오름차순 정렬
         slips.sort(key=lambda s: s.purchase_datetime)
 
-        await interaction.followup.send(header)
-        for slip in slips:
-            embed = _build_embed(slip)
-            await interaction.followup.send(embed=embed)
+        embed = _build_summary_embed(header, slips)
+        await interaction.followup.send(embed=embed)
     except Exception as exc:
         logger.exception("Purchases command failed")
         await interaction.followup.send(f"조회 실패: {exc}")
@@ -488,6 +486,43 @@ async def _stats_command(interaction: discord.Interaction, period: str = "all") 
 # ------------------------------------------------------------------
 # Embed builders
 # ------------------------------------------------------------------
+
+def _build_summary_embed(header: str, slips: list[BetSlip]) -> discord.Embed:
+    """모든 슬립을 하나의 embed에 요약."""
+    total_amount = sum(s.total_amount for s in slips)
+    total_payout = sum(s.potential_payout for s in slips)
+
+    embed = discord.Embed(title=header, colour=discord.Colour.blue())
+
+    for slip in slips:
+        # 경기 목록 한 줄씩
+        match_lines = []
+        for m in slip.matches:
+            line = f"`{m.home_team}` vs `{m.away_team}` → **{m.bet_selection}** ({m.odds:.2f})"
+            match_lines.append(line)
+
+        if not match_lines:
+            match_lines.append("상세 정보 없음")
+
+        # 슬립 요약
+        status_icon = {"발매중": "🟢", "발매마감": "🟠", "적중": "🏆", "미적중": "❌", "적중안됨": "❌", "취소": "🚫"}.get(slip.status, "⚪")
+        slip_header = f"{status_icon} {slip.purchase_datetime or '-'} | {slip.total_amount:,}원"
+        if slip.combined_odds:
+            slip_header += f" | 배당 {slip.combined_odds:.2f}"
+        if slip.potential_payout:
+            slip_header += f" | 예상 {slip.potential_payout:,}원"
+
+        value = slip_header + "\n" + "\n".join(match_lines)
+        embed.add_field(name=f"🎫 {slip.slip_id}", value=value, inline=False)
+
+    # 합계 footer
+    footer = f"총 {len(slips)}건 | 총 구매: {total_amount:,}원"
+    if total_payout:
+        footer += f" | 총 예상적중: {total_payout:,}원"
+    embed.set_footer(text=footer)
+
+    return embed
+
 
 def _build_embed(slip: BetSlip) -> discord.Embed:
     colour = _STATUS_COLOURS.get(slip.status, discord.Colour.blurple())
