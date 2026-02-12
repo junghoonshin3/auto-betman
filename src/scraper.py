@@ -61,7 +61,13 @@ class BetmanScraper:
                         }
                     }
                 }""")
-                await page.wait_for_timeout(5000)
+                try:
+                    await page.wait_for_function(
+                        "() => document.querySelectorAll('#purchaseWinTable tbody tr').length > 0",
+                        timeout=10000,
+                    )
+                except Exception:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception as exc:
                 logger.debug("Failed to expand page size: %s", exc)
 
@@ -121,7 +127,7 @@ class BetmanScraper:
         current_url = page.url
         if not current_url or "betman.co.kr" not in current_url:
             await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(4000)
+            await page.wait_for_load_state("networkidle", timeout=15000)
 
         await self._dismiss_popups(page)
 
@@ -136,9 +142,12 @@ class BetmanScraper:
         for sel in buy_link_selectors:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=8000):
+                if await loc.is_visible(timeout=3000):
                     await loc.click()
-                    await page.wait_for_timeout(5000)
+                    try:
+                        await page.wait_for_selector("#purchaseWinTable", timeout=15000)
+                    except Exception:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
                     if await page.locator(".errorArea").count() == 0:
                         logger.info("Navigated to purchase history via link: %s", page.url)
                         return
@@ -151,14 +160,17 @@ class BetmanScraper:
             try:
                 logger.info("Trying JS navigation to %s", path)
                 await page.evaluate(f"movePageUrl('{path}')")
-                await page.wait_for_timeout(5000)
+                try:
+                    await page.wait_for_selector("#purchaseWinTable", timeout=15000)
+                except Exception:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
                 if await page.locator(".errorArea").count() == 0:
                     logger.info("Navigated to purchase history via JS: %s", page.url)
                     return
                 logger.info("JS navigation to %s returned error page", path)
                 # Go back to main page for next attempt
                 await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(3000)
+                await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception as exc:
                 logger.debug("JS navigation to %s failed: %s", path, exc)
                 continue
@@ -169,7 +181,7 @@ class BetmanScraper:
             try:
                 resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 if resp and resp.ok:
-                    await page.wait_for_timeout(4000)
+                    await page.wait_for_load_state("networkidle", timeout=10000)
                     if await page.locator(".errorArea").count() > 0:
                         logger.info("Direct path %s returned error page, skipping", path)
                         continue
@@ -448,13 +460,103 @@ class BetmanScraper:
         slips: list[BetSlip],
         detail_params_list: list[dict],
     ) -> None:
-        """Fetch match details for each slip via /mypgPurWin/getGameDetail.do API."""
+        """Fetch match details for each slip via /mypgPurWin/getGameDetail.do API.
+
+        Uses a single page.evaluate() with Promise.all to fetch all details
+        in parallel, instead of serial per-slip calls.
+        """
+        # Build list of (index, params) for slips that have btkNum
+        valid_entries: list[tuple[int, dict]] = [
+            (i, params)
+            for i, (slip, params) in enumerate(zip(slips, detail_params_list))
+            if params.get("btkNum")
+        ]
+        if not valid_entries:
+            return
+
+        params_list = [params for _, params in valid_entries]
+
+        try:
+            # Batch all API calls into a single evaluate with Promise.all
+            results = await page.evaluate(
+                """(paramsList) => {
+                    return Promise.all(paramsList.map(params =>
+                        new Promise((resolve) => {
+                            const timeout = setTimeout(() => resolve(null), 30000);
+                            try {
+                                if (typeof requestClient !== 'undefined' && requestClient.requestPostMethod) {
+                                    requestClient.requestPostMethod(
+                                        "/mypgPurWin/getGameDetail.do",
+                                        params,
+                                        true,
+                                        function(data) {
+                                            clearTimeout(timeout);
+                                            resolve(JSON.stringify(data));
+                                        }
+                                    );
+                                } else {
+                                    clearTimeout(timeout);
+                                    resolve(null);
+                                }
+                            } catch(e) {
+                                clearTimeout(timeout);
+                                resolve(null);
+                            }
+                        })
+                    ));
+                }""",
+                params_list,
+            )
+        except Exception as exc:
+            logger.warning("Batch detail fetch failed: %s, falling back to serial", exc)
+            await self._fetch_match_details_serial(page, slips, detail_params_list)
+            return
+
+        # Process results
         debug_saved = False
+        for (slip_idx, _params), result in zip(valid_entries, results):
+            if result is None:
+                continue
+            try:
+                # Save first response for debugging
+                if not debug_saved:
+                    debug_path = Path("storage/debug_game_detail.json")
+                    debug_path.parent.mkdir(parents=True, exist_ok=True)
+                    debug_path.write_text(result, encoding="utf-8")
+                    logger.info(
+                        "Game detail debug saved (%d bytes) for %s",
+                        len(result),
+                        slips[slip_idx].slip_id,
+                    )
+                    debug_saved = True
+
+                data = json.loads(result)
+                matches, slip_meta = self._parse_game_detail(data)
+                if matches:
+                    slips[slip_idx].matches = matches
+                    if slip_meta.get("combined_odds"):
+                        slips[slip_idx].combined_odds = slip_meta["combined_odds"]
+                    if slip_meta.get("potential_payout"):
+                        slips[slip_idx].potential_payout = slip_meta["potential_payout"]
+                    logger.info(
+                        "Parsed %d matches for slip %s",
+                        len(matches),
+                        slips[slip_idx].slip_id,
+                    )
+            except Exception as exc:
+                logger.debug("Failed to parse detail for %s: %s", slips[slip_idx].slip_id, exc)
+
+    async def _fetch_match_details_serial(
+        self,
+        page: Page,
+        slips: list[BetSlip],
+        detail_params_list: list[dict],
+    ) -> None:
+        """Fallback: fetch match details one at a time (used if batch fails)."""
         for slip, params in zip(slips, detail_params_list):
             if not params.get("btkNum"):
                 continue
             try:
-                # Use the site's own requestClient which handles auth/CSRF
                 result = await page.evaluate(
                     """(params) => {
                         return new Promise((resolve, reject) => {
@@ -482,33 +584,15 @@ class BetmanScraper:
                     }""",
                     params,
                 )
-
-                # Save first response for debugging
-                if not debug_saved:
-                    debug_path = Path("storage/debug_game_detail.json")
-                    debug_path.parent.mkdir(parents=True, exist_ok=True)
-                    debug_path.write_text(result, encoding="utf-8")
-                    logger.info(
-                        "Game detail debug saved (%d bytes) for %s",
-                        len(result),
-                        slip.slip_id,
-                    )
-                    debug_saved = True
-
                 data = json.loads(result)
                 matches, slip_meta = self._parse_game_detail(data)
                 if matches:
                     slip.matches = matches
-                    # Update slip with additional info from detail API
                     if slip_meta.get("combined_odds"):
                         slip.combined_odds = slip_meta["combined_odds"]
                     if slip_meta.get("potential_payout"):
                         slip.potential_payout = slip_meta["potential_payout"]
-                    logger.info(
-                        "Parsed %d matches for slip %s",
-                        len(matches),
-                        slip.slip_id,
-                    )
+                    logger.info("Parsed %d matches for slip %s", len(matches), slip.slip_id)
             except Exception as exc:
                 logger.debug("Failed to fetch detail for %s: %s", slip.slip_id, exc)
 
@@ -673,7 +757,7 @@ class BetmanScraper:
         """
         # 1. Navigate to main page
         await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
+        await page.wait_for_load_state("networkidle", timeout=15000)
         await self._dismiss_popups(page)
 
         # 2. Round title (e.g. "승부식 19회차")
@@ -695,14 +779,17 @@ class BetmanScraper:
                     logger.info("Found gameSlip.do link: %s", slip_url)
                     await page.evaluate(f"location.href = '{slip_url}'")
                     await page.wait_for_load_state("domcontentloaded")
-                    await page.wait_for_timeout(5000)
+                    try:
+                        await page.wait_for_selector("#tbd_gmBuySlipList tr", timeout=15000)
+                    except Exception:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
                     await self._dismiss_popups(page)
 
                     # Check for error page
                     if await page.locator(".errorArea").count() > 0:
                         logger.warning("gameSlip.do returned error page, falling back to main page")
                         await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
-                        await page.wait_for_timeout(5000)
+                        await page.wait_for_load_state("networkidle", timeout=15000)
                         await self._dismiss_popups(page)
                     else:
                         navigated_to_slip = True
@@ -865,8 +952,8 @@ class BetmanScraper:
         for sel in ['button:has-text("확인")', 'button:has-text("닫기")', ".popup_close", ".layer_close"]:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=2000):
+                if await loc.is_visible(timeout=1000):
                     await loc.click()
-                    await page.wait_for_timeout(400)
+                    await page.wait_for_timeout(300)
             except Exception:
                 continue

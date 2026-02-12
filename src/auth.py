@@ -52,7 +52,7 @@ _LOGIN_BTN_SELECTORS = [
 ]
 
 
-async def _try_selectors(page: Page, selectors: list[str], *, timeout: int = 8000) -> str | None:
+async def _try_selectors(page: Page, selectors: list[str], *, timeout: int = 3000) -> str | None:
     """Return the first selector that matches a visible element, or None."""
     for sel in selectors:
         try:
@@ -64,7 +64,7 @@ async def _try_selectors(page: Page, selectors: list[str], *, timeout: int = 800
     return None
 
 
-async def _try_selectors_in_frame(frame, selectors: list[str], *, timeout: int = 8000) -> str | None:
+async def _try_selectors_in_frame(frame, selectors: list[str], *, timeout: int = 3000) -> str | None:
     """Like _try_selectors but works on a Frame object."""
     for sel in selectors:
         try:
@@ -85,28 +85,35 @@ class BetmanAuth:
         """Check login status by navigating to main page and looking for auth indicators."""
         try:
             await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(3000)
 
-            # Check for logged-in indicators on main page
+            # Wait for the JS variable to be defined (fastest check)
+            try:
+                await page.wait_for_function(
+                    "() => typeof isLogin !== 'undefined'", timeout=10000
+                )
+                is_login = await page.evaluate("() => isLogin === true")
+                if is_login:
+                    logger.debug("Logged in detected via JS isLogin variable")
+                    return True
+                # isLogin is defined but false → not logged in
+                logger.debug("JS isLogin is false")
+                return False
+            except Exception:
+                pass
+
+            # Fallback: check DOM selectors
             logged_in_selectors = [
                 ".stateLogIn",                    # logged-in header div
                 'a:has-text("로그아웃")',           # logout link
                 'a:has-text("마이페이지")',          # mypage link
-                ':text("로그아웃")',
             ]
             for sel in logged_in_selectors:
                 try:
-                    if await page.locator(sel).first.is_visible(timeout=5000):
+                    if await page.locator(sel).first.is_visible(timeout=3000):
                         logger.debug("Logged-in indicator found: %s", sel)
                         return True
                 except Exception:
                     continue
-
-            # Also check via JavaScript variable
-            is_login = await page.evaluate("() => typeof isLogin !== 'undefined' && isLogin === true")
-            if is_login:
-                logger.debug("Logged in detected via JS isLogin variable")
-                return True
 
             return False
         except Exception as exc:
@@ -131,7 +138,7 @@ class BetmanAuth:
 
         logger.info("Starting login flow …")
         await page.goto(self._config.base_url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(4000)
+        await page.wait_for_load_state("networkidle", timeout=15000)
 
         # Save main page HTML for debugging
         debug_dir = Path("storage")
@@ -152,8 +159,7 @@ class BetmanAuth:
         logger.info("Opening login modal via openLoginPop() …")
         try:
             await page.evaluate("openLoginPop()")
-            await page.wait_for_timeout(5000)
-            # The modal loads login form into the page DOM
+            # Wait for login form to appear in modal
             id_sel = await _try_selectors(page, _USER_ID_SELECTORS, timeout=10000)
             if id_sel:
                 logger.info("Login form found in modal")
@@ -162,11 +168,10 @@ class BetmanAuth:
 
         # Strategy 2: Click login link (may trigger modal or popup)
         if not id_sel:
-            link_sel = await _try_selectors(page, _LOGIN_LINK_SELECTORS, timeout=8000)
+            link_sel = await _try_selectors(page, _LOGIN_LINK_SELECTORS, timeout=3000)
             if link_sel:
                 logger.info("Clicking login link: %s", link_sel)
                 await page.locator(link_sel).first.click()
-                await page.wait_for_timeout(5000)
                 id_sel = await _try_selectors(page, _USER_ID_SELECTORS, timeout=10000)
                 if id_sel:
                     logger.info("Login form found after clicking link")
@@ -176,7 +181,7 @@ class BetmanAuth:
             for frame in page.frames:
                 if frame == page.main_frame:
                     continue
-                id_sel = await _try_selectors_in_frame(frame, _USER_ID_SELECTORS, timeout=8000)
+                id_sel = await _try_selectors_in_frame(frame, _USER_ID_SELECTORS, timeout=3000)
                 if id_sel:
                     login_frame = frame
                     logger.info("Login form found in iframe: %s", frame.url)
@@ -192,7 +197,7 @@ class BetmanAuth:
                         wait_until="domcontentloaded",
                         timeout=60000,
                     )
-                    await page.wait_for_timeout(4000)
+                    await page.wait_for_load_state("networkidle", timeout=10000)
                     if await page.locator(".errorArea").count() > 0:
                         logger.info("URL %s returned error page, skipping", url_path)
                         continue
@@ -231,8 +236,12 @@ class BetmanAuth:
         await form_target.locator(btn_sel).first.click()
         logger.info("Login button clicked, waiting for response …")
 
-        # Wait for login to process
-        await page.wait_for_timeout(5000)
+        # Wait for login to process — isLogin JS variable becomes true
+        try:
+            await page.wait_for_function("() => typeof isLogin !== 'undefined' && isLogin === true", timeout=15000)
+        except Exception:
+            # Fallback: wait for network to settle
+            await page.wait_for_load_state("networkidle", timeout=10000)
 
         # Dismiss any post-login popups
         await self._dismiss_popups(page)
@@ -273,8 +282,8 @@ class BetmanAuth:
         for sel in popup_selectors:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=2000):
+                if await loc.is_visible(timeout=1000):
                     await loc.click()
-                    await page.wait_for_timeout(500)
+                    await page.wait_for_timeout(300)
             except Exception:
                 continue
