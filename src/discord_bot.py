@@ -338,6 +338,7 @@ async def _purchases_command(
 
     try:
         slips = await bot.scrape_callback(discord_user_id)
+        slips = [s for s in slips if s.status != "적중안됨"]
         if not slips:
             await interaction.followup.send("구매내역이 없습니다.")
             return
