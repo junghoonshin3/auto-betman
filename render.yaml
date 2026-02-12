@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: auto-betman
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_CHANNEL_ID
+        sync: false
+      - key: HEADLESS
+        value: "true"
+      - key: POLLING_INTERVAL_MINUTES
+        value: "30"

@@ -1,0 +1,8 @@
+playwright>=1.49
+playwright-stealth>=1.0.6
+discord.py>=2.3
+python-dotenv>=1.0
+apscheduler>=3.10
+aiosqlite>=0.19
+pytest>=8.0
+pytest-asyncio>=0.23

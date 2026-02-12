@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.example
+.venv
+venv
+__pycache__
+*.pyc
+tests
+.claude
+.DS_Store
+*.md
+pyproject.toml
