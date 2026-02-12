@@ -275,6 +275,15 @@ class BetmanAuth:
     @staticmethod
     async def _dismiss_popups(page: Page) -> None:
         """Close common Betman popups (responsible gambling warnings, etc.)."""
+        # Force-close jQuery UI dialogs (BUIDynamicModal) via JS
+        try:
+            await page.evaluate("""() => {
+                document.querySelectorAll('.ui-dialog').forEach(d => d.remove());
+                document.querySelectorAll('.ui-widget-overlay').forEach(o => o.remove());
+            }""")
+        except Exception:
+            pass
+
         popup_selectors = [
             'button:has-text("확인")',
             'button:has-text("닫기")',
@@ -282,6 +291,7 @@ class BetmanAuth:
             ".layer_close",
             'a:has-text("닫기")',
             ".modal .close",
+            ".ui-dialog-titlebar-close",
         ]
         for sel in popup_selectors:
             try:

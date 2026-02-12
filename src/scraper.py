@@ -982,8 +982,18 @@ class BetmanScraper:
 
     @staticmethod
     async def _dismiss_popups(page: Page) -> None:
-        """Close any overlay popups."""
-        for sel in ['button:has-text("확인")', 'button:has-text("닫기")', ".popup_close", ".layer_close"]:
+        """Close any overlay popups including jQuery UI dialogs."""
+        # Force-close jQuery UI dialogs (BUIDynamicModal) via JS
+        try:
+            await page.evaluate("""() => {
+                document.querySelectorAll('.ui-dialog').forEach(d => d.remove());
+                document.querySelectorAll('.ui-widget-overlay').forEach(o => o.remove());
+            }""")
+        except Exception:
+            pass
+
+        for sel in ['button:has-text("확인")', 'button:has-text("닫기")', ".popup_close", ".layer_close",
+                     ".ui-dialog-titlebar-close"]:
             try:
                 loc = page.locator(sel).first
                 if await loc.is_visible(timeout=1000):
