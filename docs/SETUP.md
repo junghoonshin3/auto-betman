@@ -2,6 +2,10 @@
 
 ## 사전 준비
 
+### 무료 서버 배포 참고
+
+- 24시간 상시 운영 기준 무료/저비용 서버 선택과 Oracle 배포 절차는 `docs/HOSTING_FREE.md`를 참고하세요.
+
 ### 1. Discord 봇 생성 및 토큰 발급
 
 1. [Discord Developer Portal](https://discord.com/developers/applications)에 접속

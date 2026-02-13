@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -8,6 +9,27 @@ from playwright.async_api import Page
 logger = logging.getLogger(__name__)
 
 DEBUG_DIR = Path("storage")
+
+
+class TransientNetworkError(RuntimeError):
+    """Raised when login state probe fails due to transient network issues."""
+
+
+def _is_transient_network_error(message: str) -> bool:
+    text = (message or "").lower()
+    signals = (
+        "err_connection_refused",
+        "net::err_",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "connection closed",
+        "econnreset",
+        "enotfound",
+        "temporary failure",
+    )
+    return any(sig in text for sig in signals)
 
 
 async def _block_kos(route) -> None:
@@ -103,3 +125,48 @@ async def login(page: Page, user_id: str, user_pw: str) -> bool:
     except Exception as exc:
         logger.error("Login failed: %s", exc)
         return False
+
+
+async def is_logged_in(page: Page, retries: int = 2, base_delay: float = 0.5) -> bool:
+    """Best-effort login state check based on site JS/global navigation."""
+    attempts = max(1, retries + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            await page.goto("https://www.betman.co.kr", wait_until="domcontentloaded", timeout=30000)
+            await page.evaluate("window.stop()")
+            return bool(
+                await page.evaluate(
+                    """() => {
+                        try {
+                            if (typeof isLogin !== 'undefined' && isLogin === true) return true;
+                        } catch (e) {}
+
+                        const bodyText = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+                        if (bodyText.includes('로그아웃')) return true;
+
+                        const logoutSelector = [
+                            'a[onclick*="logout"]',
+                            'a[href*="logout"]',
+                            '.btn_logout',
+                            '.logout'
+                        ].join(',');
+                        return !!document.querySelector(logoutSelector);
+                    }"""
+                )
+            )
+        except Exception as exc:
+            if _is_transient_network_error(str(exc)):
+                logger.warning(
+                    "Transient network error while determining login state (attempt %d/%d): %s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(max(0.0, base_delay) * attempt)
+                    continue
+                raise TransientNetworkError(str(exc)) from exc
+
+            logger.info("Unable to determine login state: %s", exc)
+            return False
+    return False

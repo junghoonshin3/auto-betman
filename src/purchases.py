@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
 import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any
 
 from playwright.async_api import Page
 
@@ -110,29 +111,11 @@ def _format_buy_datetime(raw: Any) -> str:
     return text
 
 
-def _subtract_month(date_value: datetime) -> datetime:
-    year = date_value.year
-    month = date_value.month - 1
-    if month == 0:
-        month = 12
-        year -= 1
-
-    last_day = calendar.monthrange(year, month)[1]
-    day = min(date_value.day, last_day)
-    return date_value.replace(year=year, month=month, day=day)
-
-
 def _subtract_years(date_value: datetime, years: int) -> datetime:
     year = date_value.year - years
     last_day = calendar.monthrange(year, date_value.month)[1]
     day = min(date_value.day, last_day)
     return date_value.replace(year=year, day=day)
-
-
-def _month_range_ymd(now: datetime | None = None) -> tuple[str, str]:
-    base = now.astimezone(KST) if now else datetime.now(KST)
-    start = _subtract_month(base)
-    return start.strftime("%Y%m%d"), base.strftime("%Y%m%d")
 
 
 def _recent5_range_ymd(now: datetime | None = None) -> tuple[str, str]:
@@ -329,6 +312,34 @@ def _extract_purchase_items(data: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _build_recent_purchases_token_from_items(items: list[dict[str, Any]], limit: int = 5) -> str:
+    rows: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "btkNum": str(item.get("btkNum") or "").strip(),
+                "buyDtm": str(item.get("buyDtm") or "").strip(),
+                "buyStatusCode": str(item.get("buyStatusCode") or "").strip(),
+                "buyAmt": str(item.get("buyAmt") or "").strip(),
+                "procRsltClCd": str(item.get("procRsltClCd") or "").strip(),
+                "gmStCd": str(item.get("gmStCd") or "").strip(),
+            }
+        )
+
+    rows.sort(
+        key=lambda row: (
+            _parse_dt_for_sort(_format_buy_datetime(row["buyDtm"])),
+            row["btkNum"],
+        ),
+        reverse=True,
+    )
+    selected = rows[: max(1, limit)]
+    raw = json.dumps(selected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 async def _dismiss_popups(page: Page) -> None:
     await page.evaluate(
         """() => {
@@ -419,17 +430,38 @@ async def _get_base_search_params(page: Page) -> dict[str, Any]:
     return result if isinstance(result, dict) else {}
 
 
+async def probe_recent_purchases_token(page: Page, limit: int = 5) -> str:
+    limit = max(1, min(limit, 30))
+    await navigate_to_purchase_history(page)
+    await page.wait_for_function(
+        """() => typeof requestClient !== 'undefined' && typeof requestClient.requestPostMethod === 'function'""",
+        timeout=10000,
+    )
+
+    base_params = await _get_base_search_params(page)
+    params = _build_search_params(start_row=1, page_cnt=max(limit, 5), base_params=base_params)
+    result = await _request_post_method(page, "/mypgPurWin/getGameList.do", params)
+
+    if not isinstance(result, dict):
+        raise RuntimeError("purchase probe failed: list api returned non-dict")
+    if result.get("__error"):
+        raise RuntimeError(f"purchase probe failed: {result.get('__error')}")
+    if result.get("__timeout"):
+        raise RuntimeError("purchase probe failed: timeout")
+
+    items = _extract_purchase_items(result)
+    token = _build_recent_purchases_token_from_items(items, limit=limit)
+    logger.info("purchase probe token generated: limit=%d items=%d", limit, len(items))
+    return token
+
+
 def _build_search_params(
-    mode: Literal["recent5", "month30"],
     start_row: int,
     page_cnt: int,
     base_params: dict[str, Any],
 ) -> dict[str, Any]:
     now = datetime.now(KST)
-    if mode == "month30":
-        start_date, end_date = _month_range_ymd(now)
-    else:
-        start_date, end_date = _recent5_range_ymd(now)
+    start_date, end_date = _recent5_range_ymd(now)
 
     params = dict(base_params)
     params.update(
@@ -467,7 +499,6 @@ def _dedup_and_merge(slips: list[BetSlip]) -> list[BetSlip]:
 
 async def _collect_slips_via_list_api(
     page: Page,
-    mode: Literal["recent5", "month30"],
     limit: int,
 ) -> tuple[list[BetSlip], dict[str, dict[str, str]], dict[str, Any]]:
     await page.wait_for_function(
@@ -477,7 +508,7 @@ async def _collect_slips_via_list_api(
 
     base_params = await _get_base_search_params(page)
     start_row = 1
-    page_cnt = 5 if mode == "recent5" else 30
+    page_cnt = 5
 
     merged: dict[str, BetSlip] = {}
     detail_params: dict[str, dict[str, str]] = {}
@@ -493,7 +524,7 @@ async def _collect_slips_via_list_api(
         if len(merged) >= limit:
             break
 
-        params = _build_search_params(mode, start_row, page_cnt, base_params)
+        params = _build_search_params(start_row, page_cnt, base_params)
         result = await _request_post_method(page, "/mypgPurWin/getGameList.do", params)
         diagnostics["pages"] += 1
 
@@ -815,7 +846,6 @@ async def _fetch_match_details_for_slips(
 async def scrape_purchase_history(
     page: Page,
     limit: int,
-    mode: Literal["recent5", "month30"] = "recent5",
 ) -> list[BetSlip]:
     limit = max(1, min(limit, 30))
 
@@ -823,12 +853,11 @@ async def scrape_purchase_history(
 
     # Source 1: official list API (most accurate)
     try:
-        slips, detail_params, diagnostics = await _collect_slips_via_list_api(page, mode, limit)
+        slips, detail_params, diagnostics = await _collect_slips_via_list_api(page, limit)
         if slips:
             success, failed = await _fetch_match_details_for_slips(page, slips, detail_params)
             logger.info(
-                "purchase scrape api mode=%s items=%d list_pages=%d detail_success=%d detail_failed=%d",
-                mode,
+                "purchase scrape api items=%d list_pages=%d detail_success=%d detail_failed=%d",
                 len(slips),
                 diagnostics.get("pages", 0),
                 success,

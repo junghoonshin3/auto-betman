@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.bot import _build_slip_embed, _build_summary_embed
+from src.bot import _build_compact_purchase_embeds, _build_slip_embed, _build_summary_embed
 from src.models import BetSlip, MatchBet
 
 
@@ -36,30 +36,105 @@ def _sample_slip(result: str | None = "적중") -> BetSlip:
 
 def test_summary_embed_fields_and_values() -> None:
     slips = [_sample_slip("적중"), _sample_slip("미적중")]
-    embed = _build_summary_embed(slips, "최근 1개월(최대 30개)")
+    embed = _build_summary_embed(slips, "최근 5개")
 
-    assert "최근 1개월" in embed.title
+    assert "최근 5개" in embed.title
     fields = {f.name: f.value for f in embed.fields}
     assert fields["조회 건수"] == "2건"
     assert fields["총 구매금액"] == "10,000원"
     assert fields["총 실제적중금"] == "12,000원"
+    assert "총 예상적중금" not in fields
 
 
-def test_slip_embed_contains_required_detail_lines() -> None:
+def test_compact_embed_contains_all_matches() -> None:
     slip = _sample_slip("적중")
-    embed = _build_slip_embed(1, slip)
-    assert "A1B2-C3D4-E5F6-0001" in embed.title
+    slip.matches.append(
+        MatchBet(
+            match_number=2,
+            sport="농구",
+            league="KBL",
+            home_team="A",
+            away_team="B",
+            bet_selection="패",
+            odds=1.87,
+            match_datetime="2026.02.14 20:00",
+            result="미적중",
+            score="80:75",
+            game_result="승",
+        )
+    )
 
-    combined_values = "\n".join(field.value for field in embed.fields)
-    assert "내 선택:" in combined_values
-    assert "실제 결과:" in combined_values
-    assert "내 베팅 결과:" in combined_values
+    embeds = _build_compact_purchase_embeds([slip])
+    assert len(embeds) >= 2
+
+    details = "\n".join((e.description or "") for e in embeds[1:])
+    assert "[1] 🏆 `A1B2-C3D4-E5F6-0001` · 적중 (결과: 적중)" in details
+    assert "구매시각 2026.02.13 10:30 · 구매 5,000원 · 배당 2.40" in details
+    assert "1. 전북 vs 울산 | 선택 승(2.10) | 실제 승 | 2:1 | 내결과 적중" in details
+    assert "2. A vs B | 선택 패(1.87) | 실제 승 | 80:75 | 내결과 미적중" in details
 
 
-def test_slip_embed_shows_pending_when_match_result_not_explicit() -> None:
+def test_compact_embed_hides_match_result_when_not_explicit() -> None:
     slip = _sample_slip(None)
     slip.matches[0].result = None
-    embed = _build_slip_embed(1, slip)
+    slip.matches[0].score = ""
+    slip.matches[0].game_result = ""
+    embeds = _build_compact_purchase_embeds([slip])
 
-    combined_values = "\n".join(field.value for field in embed.fields)
-    assert "대기" in combined_values
+    details = "\n".join((e.description or "") for e in embeds[1:])
+    assert "1. 전북 vs 울산 | 선택 승(2.10) | 실제 대기" in details
+    assert "내결과:" not in details
+    assert "내결과 " not in details
+
+
+def test_slip_embed_hides_pending_match_result_line() -> None:
+    slip = _sample_slip(None)
+    slip.matches[0].result = None
+    slip.matches[0].score = ""
+    slip.matches[0].game_result = ""
+
+    embed = _build_slip_embed(1, slip)
+    values = "\n".join(field.value for field in embed.fields)
+    assert "실제 결과: 대기" in values
+    assert "내 베팅 결과:" not in values
+
+
+def test_compact_embed_chunks_when_too_long() -> None:
+    slips: list[BetSlip] = []
+    for i in range(1, 6):
+        matches: list[MatchBet] = []
+        for j in range(1, 40):
+            matches.append(
+                MatchBet(
+                    match_number=j,
+                    sport="축구",
+                    league="리그",
+                    home_team=f"홈{j}",
+                    away_team=f"원정{j}",
+                    bet_selection="승",
+                    odds=2.10,
+                    match_datetime="2026.02.14 19:00",
+                    result="적중",
+                    score="2:1",
+                    game_result="승",
+                )
+            )
+
+        slips.append(
+            BetSlip(
+                slip_id=f"S-{i:04d}",
+                game_type="프로토",
+                round_number="19회차",
+                status="적중",
+                purchase_datetime="2026.02.13 10:30",
+                total_amount=5000,
+                potential_payout=12000,
+                combined_odds=2.40,
+                result="적중",
+                actual_payout=12000,
+                matches=matches,
+            )
+        )
+
+    embeds = _build_compact_purchase_embeds(slips)
+    assert len(embeds) > 2

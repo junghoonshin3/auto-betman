@@ -35,3 +35,39 @@ class BetSlip:
     @property
     def title(self) -> str:
         return f"{self.game_type} {self.round_number}".strip()
+
+
+@dataclass
+class PurchaseAnalysis:
+    months: int
+    purchase_amount: int
+    winning_amount: int
+
+
+@dataclass
+class SaleGameMatch:
+    gm_id: str
+    gm_ts: str
+    game_name: str
+    sport: str
+    league: str
+    match_seq: int
+    home_team: str
+    away_team: str
+    bet_type: str
+    odds_home: float | None
+    odds_draw: float | None
+    odds_away: float | None
+    sale_end_at: str
+    sale_end_epoch_ms: int | None
+    status: str
+
+
+@dataclass
+class SaleGamesSnapshot:
+    fetched_at: str
+    total_games: int
+    total_matches: int
+    sport_counts: dict[str, int]
+    nearest_matches: list[SaleGameMatch]
+    partial_failures: int

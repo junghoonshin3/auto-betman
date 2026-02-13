@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 import logging
-from typing import Awaitable, Callable, Literal
+from pathlib import Path
+from typing import Awaitable, Callable
 
 import discord
 from discord import app_commands
 
-from src.models import BetSlip, MatchBet
+from src.models import BetSlip, MatchBet, PurchaseAnalysis, SaleGamesSnapshot
 
 logger = logging.getLogger(__name__)
+LOGIN_ID_MAP_PATH = Path("storage/login_id_map.json")
 
 _STATUS_COLOR = {
     "발매중": discord.Color.green(),
@@ -36,21 +39,70 @@ _MATCH_RESULT_ICON = {
 }
 
 
+def _load_login_id_map(path: Path = LOGIN_ID_MAP_PATH) -> dict[str, str]:
+    try:
+        if not path.exists():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): str(v) for k, v in raw.items() if str(v).strip()}
+    except Exception:
+        return {}
+
+
+def _save_login_id_map(data: dict[str, str], path: Path = LOGIN_ID_MAP_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _get_saved_login_id(discord_user_id: str, path: Path = LOGIN_ID_MAP_PATH) -> str | None:
+    data = _load_login_id_map(path)
+    value = data.get(str(discord_user_id), "").strip()
+    return value or None
+
+
+def _set_saved_login_id(discord_user_id: str, login_id: str, path: Path = LOGIN_ID_MAP_PATH) -> None:
+    value = login_id.strip()
+    if not value:
+        return
+    data = _load_login_id_map(path)
+    data[str(discord_user_id)] = value
+    _save_login_id_map(data, path)
+
+
 class LoginModal(discord.ui.Modal, title="베트맨 로그인"):
     user_id = discord.ui.TextInput(label="아이디", placeholder="betman ID")
     user_pw = discord.ui.TextInput(label="비밀번호", placeholder="betman PW", max_length=50)
 
-    def __init__(self, login_callback: Callable[[str, str], Awaitable[bool]]) -> None:
+    def __init__(
+        self,
+        login_callback: Callable[[str, str, str], Awaitable[bool]],
+        discord_user_id: str,
+        default_user_id: str | None = None,
+    ) -> None:
         super().__init__()
         self._login_callback = login_callback
+        self._discord_user_id = str(discord_user_id)
+        if default_user_id:
+            self.user_id.default = default_user_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
-        success = await self._login_callback(self.user_id.value, self.user_pw.value)
+        progress_message = await interaction.followup.send("로그인 시도중...", ephemeral=True, wait=True)
+        success = await self._login_callback(self._discord_user_id, self.user_id.value, self.user_pw.value)
+
         if success:
-            await interaction.followup.send("로그인 성공", ephemeral=True)
-        else:
-            await interaction.followup.send("로그인 실패", ephemeral=True)
+            try:
+                _set_saved_login_id(self._discord_user_id, self.user_id.value)
+            except Exception as exc:
+                logger.warning("Failed to save login id autofill: %s", exc)
+
+        final_text = "로그인 성공" if success else "로그인 실패"
+        try:
+            await progress_message.edit(content=final_text)
+        except Exception:
+            await interaction.followup.send(final_text, ephemeral=True)
 
 
 def _format_won(value: int) -> str:
@@ -80,9 +132,11 @@ def _embed_color(slip: BetSlip) -> discord.Color:
     return _STATUS_COLOR.get(slip.status, discord.Color.blurple())
 
 
-def _match_result_text(match: MatchBet) -> str:
-    icon = _MATCH_RESULT_ICON.get(match.result or "", "⏳")
-    return f"{icon} {match.result or '대기'}"
+def _match_result_text(match: MatchBet) -> str | None:
+    if not match.result:
+        return None
+    icon = _MATCH_RESULT_ICON.get(match.result, "⏳")
+    return f"{icon} {match.result}"
 
 
 def _actual_result_text(match: MatchBet) -> str:
@@ -96,9 +150,20 @@ def _actual_result_text(match: MatchBet) -> str:
     return " | ".join(parts)
 
 
+def _format_match_line(match: MatchBet, index: int) -> str:
+    odds_text = f"({match.odds:.2f})" if match.odds else ""
+    line = (
+        f"{index}. {match.home_team} vs {match.away_team} | "
+        f"선택 {match.bet_selection or '-'}{odds_text} | "
+        f"실제 {_actual_result_text(match)}"
+    )
+    if match.result:
+        line += f" | 내결과 {match.result}"
+    return line
+
+
 def _build_summary_embed(slips: list[BetSlip], mode_label: str) -> discord.Embed:
     total_purchase = sum(max(s.total_amount, 0) for s in slips)
-    total_expected = sum(max(s.potential_payout, 0) for s in slips)
     total_actual = sum(max(s.actual_payout, 0) for s in slips)
 
     wins = sum(1 for s in slips if s.result == "적중" or s.status == "적중")
@@ -112,9 +177,65 @@ def _build_summary_embed(slips: list[BetSlip], mode_label: str) -> discord.Embed
     embed.add_field(name="조회 건수", value=f"{len(slips)}건", inline=True)
     embed.add_field(name="적중/미적중/대기", value=f"{wins}/{losses}/{pending}", inline=True)
     embed.add_field(name="총 구매금액", value=_format_won(total_purchase), inline=True)
-    embed.add_field(name="총 예상적중금", value=_format_won(total_expected), inline=True)
     embed.add_field(name="총 실제적중금", value=_format_won(total_actual), inline=True)
     embed.add_field(name="총 손익", value=_format_won(total_actual - total_purchase), inline=True)
+    return embed
+
+
+def _build_analysis_embed(result: PurchaseAnalysis) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"구매현황분석 (최근 {result.months}개월)",
+        colour=discord.Color.dark_blue(),
+    )
+    embed.add_field(name="구매금액", value=_format_won(result.purchase_amount), inline=True)
+    embed.add_field(name="적중금액", value=_format_won(result.winning_amount), inline=True)
+    return embed
+
+
+def _build_games_summary_embed(snapshot: SaleGamesSnapshot) -> discord.Embed:
+    embed = discord.Embed(
+        title="발매중 전체 경기 요약",
+        colour=discord.Color.green(),
+    )
+    embed.add_field(name="수집시각", value=snapshot.fetched_at, inline=False)
+    embed.add_field(name="전체 게임/전체 경기", value=f"{snapshot.total_games} / {snapshot.total_matches}", inline=False)
+
+    if snapshot.sport_counts:
+        sport_lines = [f"{sport}: {count}" for sport, count in snapshot.sport_counts.items()]
+        embed.add_field(name="종목별 경기수", value="\n".join(sport_lines)[:1024], inline=False)
+    else:
+        embed.add_field(name="종목별 경기수", value="-", inline=False)
+
+    nearest_lines: list[str] = []
+    for idx, match in enumerate(snapshot.nearest_matches, start=1):
+        team_text = f"{match.home_team} vs {match.away_team}".strip()
+        nearest_lines.append(f"{idx}. [{match.sport}] {team_text} · {match.bet_type} · 마감 {match.sale_end_at or '-'}")
+
+    if nearest_lines:
+        max_desc = 3900
+        chunks: list[str] = []
+        current = ""
+        for line in nearest_lines:
+            candidate = line if not current else f"{current}\n{line}"
+            if len(candidate) > max_desc:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+
+        if chunks:
+            embed.description = f"마감 임박 {len(snapshot.nearest_matches)}경기\n\n{chunks[0]}"
+            for i, chunk in enumerate(chunks[1:], start=2):
+                field_name = f"마감 임박 경기 (계속 {i})"
+                embed.add_field(name=field_name, value=chunk[:1024], inline=False)
+    else:
+        embed.description = "마감 임박 경기 데이터가 없습니다."
+
+    if snapshot.partial_failures > 0:
+        embed.add_field(name="부분 실패", value=f"{snapshot.partial_failures}개 게임 상세 수집 실패", inline=False)
+
     return embed
 
 
@@ -152,8 +273,10 @@ def _build_slip_embed(index: int, slip: BetSlip) -> discord.Embed:
             f"{match.home_team} vs {match.away_team}",
             f"내 선택: {match.bet_selection or '-'} ({match.odds:.2f})" if match.odds else f"내 선택: {match.bet_selection or '-'}",
             f"실제 결과: {_actual_result_text(match)}",
-            f"내 베팅 결과: {_match_result_text(match)}",
         ]
+        match_result_text = _match_result_text(match)
+        if match_result_text:
+            lines.append(f"내 베팅 결과: {match_result_text}")
         if match.match_datetime:
             lines.insert(1, f"경기시각: {match.match_datetime}")
 
@@ -168,13 +291,92 @@ def _build_slip_embed(index: int, slip: BetSlip) -> discord.Embed:
     return embed
 
 
+def _build_compact_purchase_embeds(slips: list[BetSlip]) -> list[discord.Embed]:
+    summary = _build_summary_embed(slips, "최근 5개")
+    lines: list[str] = []
+
+    for idx, slip in enumerate(slips, start=1):
+        status = _status_text(slip)
+        odds_text = f"{slip.combined_odds:.2f}" if slip.combined_odds else "-"
+        lines.append(
+            f"[{idx}] {_slip_icon(slip)} `{slip.slip_id}` · {status}"
+        )
+        lines.append(
+            f"구매시각 {slip.purchase_datetime or '-'} · 구매 {_format_won(slip.total_amount)} · 배당 {odds_text}"
+        )
+
+        if not slip.matches:
+            lines.append("  - 상세 경기 정보를 찾지 못했습니다.")
+            lines.append("")
+            continue
+
+        for match_idx, match in enumerate(slip.matches, start=1):
+            lines.append(_format_match_line(match, match_idx))
+        lines.append("")
+
+    chunks: list[str] = []
+    current = ""
+    max_len = 3800
+    for line in lines:
+        candidate = line if not current else f"{current}\n{line}"
+        if len(candidate) > max_len:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    max_detail_embeds = 9  # summary + 9 detail = 10 embeds/message
+    if len(chunks) > max_detail_embeds:
+        chunks = chunks[:max_detail_embeds]
+        truncated_note = "\n\n... 길이 제한으로 일부 경기는 생략되었습니다."
+        if len(chunks[-1]) + len(truncated_note) > max_len:
+            chunks[-1] = chunks[-1][: max_len - len(truncated_note)]
+        chunks[-1] += truncated_note
+
+    detail_embeds: list[discord.Embed] = []
+    for i, text in enumerate(chunks, start=1):
+        title = "상세" if len(chunks) == 1 else f"상세 ({i}/{len(chunks)})"
+        detail_embeds.append(
+            discord.Embed(
+                title=title,
+                description=text,
+                colour=discord.Color.dark_teal(),
+            )
+        )
+
+    return [summary] + detail_embeds
+
+
 class Bot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-        self.login_callback: Callable[[str, str], Awaitable[bool]] | None = None
-        self.purchase_callback: Callable[[Literal["recent5", "month30"]], Awaitable[list[BetSlip]]] | None = None
+        self.login_callback: Callable[[str, str, str], Awaitable[bool]] | None = None
+        self.purchase_callback: Callable[[str], Awaitable[list[BetSlip]]] | None = None
+        self.analysis_callback: Callable[[str, int], Awaitable[PurchaseAnalysis]] | None = None
+        self.games_callback: Callable[[], Awaitable[SaleGamesSnapshot]] | None = None
+        self.logout_callback: Callable[[str], Awaitable[bool]] | None = None
+        self.sync_guild_id: int | None = None
+
+    async def _sync_application_commands(self) -> None:
+        if self.sync_guild_id is not None:
+            try:
+                guild = discord.Object(id=self.sync_guild_id)
+                self.tree.copy_global_to(guild=guild)
+                guild_commands = await self.tree.sync(guild=guild)
+                logger.info(
+                    "Guild slash commands synced. guild_id=%s count=%d",
+                    self.sync_guild_id,
+                    len(guild_commands),
+                )
+            except Exception:
+                logger.exception("Guild slash command sync failed. guild_id=%s", self.sync_guild_id)
+
+        global_commands = await self.tree.sync()
+        logger.info("Global slash commands synced. count=%d", len(global_commands))
 
     async def setup_hook(self) -> None:
         @self.tree.command(name="login", description="베트맨 로그인")
@@ -182,48 +384,92 @@ class Bot(discord.Client):
             if self.login_callback is None:
                 await interaction.response.send_message("로그인 기능이 준비되지 않았습니다.", ephemeral=True)
                 return
-            await interaction.response.send_modal(LoginModal(self.login_callback))
+            default_user_id = _get_saved_login_id(str(interaction.user.id))
+            await interaction.response.send_modal(
+                LoginModal(
+                    self.login_callback,
+                    discord_user_id=str(interaction.user.id),
+                    default_user_id=default_user_id,
+                )
+            )
 
         @self.tree.command(name="purchases", description="구매내역 조회")
-        @app_commands.describe(mode="조회 방식 선택")
-        @app_commands.choices(
-            mode=[
-                app_commands.Choice(name="가장 최근 5개", value="recent5"),
-                app_commands.Choice(name="최근 1개월 (최대 30개)", value="month30"),
-            ]
-        )
-        async def purchases_command(
-            interaction: discord.Interaction,
-            mode: app_commands.Choice[str] | None = None,
-        ) -> None:
+        async def purchases_command(interaction: discord.Interaction) -> None:
             if self.purchase_callback is None:
                 await interaction.response.send_message("구매내역 기능이 준비되지 않았습니다.", ephemeral=True)
                 return
 
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            selected_mode = mode.value if mode else "recent5"
-            mode_label = "최근 5개" if selected_mode == "recent5" else "최근 1개월(최대 30개)"
-
+            await interaction.response.defer(thinking=True)
             try:
-                slips = await self.purchase_callback(selected_mode)  # type: ignore[arg-type]
+                slips = await self.purchase_callback(str(interaction.user.id))
             except Exception as exc:
                 logger.exception("Failed to scrape purchases")
-                await interaction.followup.send(f"구매내역 조회 실패: {exc}", ephemeral=True)
+                await interaction.followup.send(f"구매내역 조회 실패: {exc}")
                 return
 
             if not slips:
-                await interaction.followup.send("조회된 구매내역이 없습니다.", ephemeral=True)
+                await interaction.followup.send("조회된 구매내역이 없습니다.")
                 return
 
-            summary = _build_summary_embed(slips, mode_label)
-            await interaction.followup.send(embed=summary, ephemeral=True)
+            embeds = _build_compact_purchase_embeds(slips)
+            await interaction.followup.send(embeds=embeds)
 
-            detail_embeds = [_build_slip_embed(i, slip) for i, slip in enumerate(slips, start=1)]
-            for i in range(0, len(detail_embeds), 5):
-                await interaction.followup.send(embeds=detail_embeds[i:i + 5], ephemeral=True)
+        @self.tree.command(name="analysis", description="구매현황분석 조회")
+        @app_commands.describe(months="조회 개월 수 (1~12, 기본 12)")
+        async def analysis_command(
+            interaction: discord.Interaction,
+            months: app_commands.Range[int, 1, 12] = 12,
+        ) -> None:
+            if self.analysis_callback is None:
+                await interaction.response.send_message("구매현황분석 기능이 준비되지 않았습니다.", ephemeral=True)
+                return
 
-        await self.tree.sync()
-        logger.info("Slash commands synced.")
+            await interaction.response.defer(thinking=True)
+            try:
+                result = await self.analysis_callback(str(interaction.user.id), int(months))
+            except Exception as exc:
+                logger.exception("Failed to scrape purchase analysis")
+                await interaction.followup.send(f"구매현황분석 조회 실패: {exc}")
+                return
+
+            await interaction.followup.send(embed=_build_analysis_embed(result))
+
+        @self.tree.command(name="games", description="발매중 전체 경기 요약 조회")
+        async def games_command(interaction: discord.Interaction) -> None:
+            if self.games_callback is None:
+                await interaction.response.send_message("경기 조회 기능이 준비되지 않았습니다.", ephemeral=True)
+                return
+
+            await interaction.response.defer(thinking=True)
+            try:
+                snapshot = await self.games_callback()
+            except Exception as exc:
+                logger.exception("Failed to scrape sale games")
+                await interaction.followup.send(f"경기 조회 실패: {exc}")
+                return
+
+            await interaction.followup.send(embed=_build_games_summary_embed(snapshot))
+
+        @self.tree.command(name="logout", description="베트맨 로그아웃")
+        async def logout_command(interaction: discord.Interaction) -> None:
+            if self.logout_callback is None:
+                await interaction.response.send_message("로그아웃 기능이 준비되지 않았습니다.", ephemeral=True)
+                return
+
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                ok = await self.logout_callback(str(interaction.user.id))
+            except Exception as exc:
+                logger.exception("Failed to logout")
+                await interaction.followup.send(f"로그아웃 실패: {exc}", ephemeral=True)
+                return
+
+            if ok:
+                await interaction.followup.send("로그아웃 완료", ephemeral=True)
+            else:
+                await interaction.followup.send("로그아웃 실패", ephemeral=True)
+
+        await self._sync_application_commands()
 
     async def on_ready(self) -> None:
         logger.info("Bot ready: %s", self.user)
