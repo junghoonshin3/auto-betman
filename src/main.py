@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -9,15 +10,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, TypeVar
 
+import discord
 from dotenv import load_dotenv
 from playwright.async_api import Browser, BrowserContext, async_playwright
 from playwright_stealth import Stealth
 
 from src import auth
 from src.analysis import probe_purchase_analysis_token, scrape_purchase_analysis
-from src.bot import Bot
+from src.bot import Bot, _build_compact_purchase_embeds
 from src.games import scrape_sale_games_summary
-from src.models import BetSlip, PurchaseAnalysis, SaleGameMatch, SaleGamesSnapshot
+from src.models import BetSlip, MatchBet, PurchaseAnalysis, SaleGameMatch, SaleGamesSnapshot
 from src.purchases import probe_recent_purchases_token, scrape_purchase_history
 
 logger = logging.getLogger(__name__)
@@ -76,6 +78,14 @@ class UserSession:
     has_authenticated: bool = False
 
 
+@dataclass
+class AutoNotifyState:
+    watch_user_ids: set[str] = field(default_factory=set)
+    seen_slip_ids_by_user: dict[str, set[str]] = field(default_factory=dict)
+    session_expired_notified_user_ids: set[str] = field(default_factory=set)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 def _parse_sync_guild_id(raw_value: str | None) -> int | None:
     if raw_value is None:
         return None
@@ -91,6 +101,351 @@ def _parse_sync_guild_id(raw_value: str | None) -> int | None:
         logger.warning("Invalid DISCORD_GUILD_ID value (must be > 0): %r", raw_value)
         return None
     return guild_id
+
+
+def _parse_notify_channel_id(raw_value: str | None) -> int | None:
+    if raw_value is None:
+        return None
+    text = raw_value.strip()
+    if not text:
+        return None
+    try:
+        channel_id = int(text)
+    except ValueError:
+        logger.warning("Invalid DISCORD_CHANNEL_ID value (not an integer): %r", raw_value)
+        return None
+    if channel_id <= 0:
+        logger.warning("Invalid DISCORD_CHANNEL_ID value (must be > 0): %r", raw_value)
+        return None
+    return channel_id
+
+
+def _parse_polling_interval_minutes(raw_value: str | None, default: int = 5) -> int:
+    if raw_value is None:
+        return default
+    text = raw_value.strip()
+    if not text:
+        return default
+    try:
+        parsed = int(text)
+    except ValueError:
+        logger.warning("Invalid POLLING_INTERVAL_MINUTES value (not an integer): %r", raw_value)
+        return default
+    return max(1, min(60, parsed))
+
+
+def _to_int(value: object, default: int = 0) -> int:
+    try:
+        text = str(value).replace(",", "").strip()
+        return int(text)
+    except Exception:
+        return default
+
+
+def _to_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(str(value).replace(",", "").strip())
+    except Exception:
+        return default
+
+
+def _build_fake_match(item: object, index: int) -> MatchBet:
+    row = item if isinstance(item, dict) else {}
+    return MatchBet(
+        match_number=_to_int(row.get("match_number", index), index),
+        sport=str(row.get("sport", "") or "").strip(),
+        league=str(row.get("league", "") or "").strip(),
+        home_team=str(row.get("home_team", "") or "").strip(),
+        away_team=str(row.get("away_team", "") or "").strip(),
+        bet_selection=str(row.get("bet_selection", "") or "").strip(),
+        odds=_to_float(row.get("odds", 0.0), 0.0),
+        match_datetime=str(row.get("match_datetime", "") or "").strip(),
+        result=(str(row.get("result", "") or "").strip() or None),
+        score=str(row.get("score", "") or "").strip(),
+        game_result=str(row.get("game_result", "") or "").strip(),
+    )
+
+
+def _build_fake_slip(item: object, index: int) -> BetSlip | None:
+    row = item if isinstance(item, dict) else {}
+    slip_id = str(row.get("slip_id", "") or "").strip()
+    if not slip_id:
+        return None
+
+    matches_raw = row.get("matches", [])
+    matches: list[MatchBet] = []
+    if isinstance(matches_raw, list):
+        for i, match_item in enumerate(matches_raw, start=1):
+            matches.append(_build_fake_match(match_item, i))
+
+    return BetSlip(
+        slip_id=slip_id,
+        game_type=str(row.get("game_type", "프로토 승부식") or "프로토 승부식").strip(),
+        round_number=str(row.get("round_number", "") or "").strip(),
+        status=str(row.get("status", "발매중") or "발매중").strip(),
+        purchase_datetime=str(row.get("purchase_datetime", "") or "").strip(),
+        total_amount=_to_int(row.get("total_amount", 0), 0),
+        potential_payout=_to_int(row.get("potential_payout", 0), 0),
+        combined_odds=_to_float(row.get("combined_odds", 0.0), 0.0),
+        result=(str(row.get("result", "") or "").strip() or None),
+        actual_payout=_to_int(row.get("actual_payout", 0), 0),
+        matches=matches,
+    )
+
+
+def _resolve_fake_purchase_rows(raw: object, discord_user_id: str) -> list[object]:
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, dict):
+        return []
+
+    by_user = raw.get("by_user")
+    if isinstance(by_user, dict):
+        user_items = by_user.get(discord_user_id)
+        if isinstance(user_items, list):
+            return user_items
+
+    user_items = raw.get(discord_user_id)
+    if isinstance(user_items, list):
+        return user_items
+
+    default_items = raw.get("default")
+    if isinstance(default_items, list):
+        return default_items
+
+    wildcard_items = raw.get("*")
+    if isinstance(wildcard_items, list):
+        return wildcard_items
+
+    return []
+
+
+def _load_fake_purchases(
+    fake_file_env: str | None,
+    discord_user_id: str,
+    limit: int,
+) -> list[BetSlip] | None:
+    text = str(fake_file_env or "").strip()
+    if not text:
+        return None
+
+    path = Path(text).expanduser()
+    if not path.exists():
+        logger.warning("FAKE_PURCHASES_FILE not found: path=%s", path)
+        return None
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Failed to read FAKE_PURCHASES_FILE: path=%s error=%s", path, exc)
+        return None
+
+    rows = _resolve_fake_purchase_rows(raw, discord_user_id)
+    slips: list[BetSlip] = []
+    for i, item in enumerate(rows, start=1):
+        slip = _build_fake_slip(item, i)
+        if slip is not None:
+            slips.append(slip)
+
+    return slips[: max(1, limit)]
+
+
+def _restore_watch_user_ids_from_session_files(session_dir: Path = SESSION_DIR) -> set[str]:
+    if not session_dir.exists():
+        return set()
+
+    restored: set[str] = set()
+    for path in session_dir.glob("session_state_*.json"):
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                continue
+        except Exception:
+            continue
+        match = re.match(r"^session_state_(.+)\.json$", path.name)
+        if match:
+            user_id = match.group(1).strip()
+            if user_id:
+                restored.add(user_id)
+    return restored
+
+
+def _build_auto_notify_content(discord_user_id: str, new_count: int) -> str:
+    return f"[자동알림] 사용자 `{discord_user_id}` 신규 구매 {new_count}건"
+
+
+def _build_session_expired_content(discord_user_id: str) -> str:
+    return f"[자동알림] 사용자 `{discord_user_id}` 세션이 만료되어 자동 알림을 중지했습니다. /login으로 다시 로그인해주세요."
+
+
+def _select_new_purchase_slips(
+    slips: list[BetSlip],
+    seen_slip_ids: set[str] | None,
+) -> tuple[list[BetSlip], set[str], bool]:
+    current_ids = [str(s.slip_id).strip() for s in slips if str(s.slip_id).strip()]
+    current_set = set(current_ids)
+    if seen_slip_ids is None:
+        return [], current_set, True
+
+    new_slips: list[BetSlip] = []
+    for slip in reversed(slips):
+        slip_id = str(slip.slip_id).strip()
+        if not slip_id:
+            continue
+        if slip_id not in seen_slip_ids:
+            new_slips.append(slip)
+    return new_slips, current_set, False
+
+
+async def _track_user_for_auto_notify(state: AutoNotifyState, discord_user_id: str) -> None:
+    user_id = str(discord_user_id)
+    async with state.lock:
+        state.watch_user_ids.add(user_id)
+        # Reset baseline so the next cycle sets current purchases as reference.
+        state.seen_slip_ids_by_user.pop(user_id, None)
+        state.session_expired_notified_user_ids.discard(user_id)
+
+
+async def _untrack_user_for_auto_notify(state: AutoNotifyState, discord_user_id: str) -> None:
+    user_id = str(discord_user_id)
+    async with state.lock:
+        state.watch_user_ids.discard(user_id)
+        state.seen_slip_ids_by_user.pop(user_id, None)
+        state.session_expired_notified_user_ids.discard(user_id)
+
+
+async def _run_auto_notify_cycle(
+    state: AutoNotifyState,
+    fetch_recent_purchases: Callable[[str], Awaitable[list[BetSlip]]],
+    send_new_purchases: Callable[[str, list[BetSlip]], Awaitable[None]],
+    send_session_expired_notice: Callable[[str], Awaitable[None]],
+) -> None:
+    async with state.lock:
+        watch_user_ids = sorted(state.watch_user_ids)
+
+    for discord_user_id in watch_user_ids:
+        try:
+            slips = await fetch_recent_purchases(discord_user_id)
+        except Exception as exc:
+            if str(exc) == _SESSION_EXPIRED_MESSAGE:
+                should_notify = False
+                async with state.lock:
+                    was_watching = discord_user_id in state.watch_user_ids
+                    state.watch_user_ids.discard(discord_user_id)
+                    state.seen_slip_ids_by_user.pop(discord_user_id, None)
+                    if was_watching and discord_user_id not in state.session_expired_notified_user_ids:
+                        state.session_expired_notified_user_ids.add(discord_user_id)
+                        should_notify = True
+                if should_notify:
+                    try:
+                        await send_session_expired_notice(discord_user_id)
+                    except Exception as send_exc:
+                        logger.warning(
+                            "Auto notify session-expired notice failed: discord_user_id=%s error=%s",
+                            discord_user_id,
+                            send_exc,
+                        )
+                continue
+            logger.warning("Auto notify purchase fetch failed: discord_user_id=%s error=%s", discord_user_id, exc)
+            continue
+
+        async with state.lock:
+            if discord_user_id not in state.watch_user_ids:
+                continue
+            seen_slip_ids = state.seen_slip_ids_by_user.get(discord_user_id)
+
+        new_slips, next_seen, baseline_only = _select_new_purchase_slips(slips, seen_slip_ids)
+
+        async with state.lock:
+            if discord_user_id not in state.watch_user_ids:
+                continue
+            state.seen_slip_ids_by_user[discord_user_id] = next_seen
+            state.session_expired_notified_user_ids.discard(discord_user_id)
+
+        if baseline_only or not new_slips:
+            continue
+
+        try:
+            await send_new_purchases(discord_user_id, new_slips)
+        except Exception as send_exc:
+            logger.warning(
+                "Auto notify send failed: discord_user_id=%s count=%d error=%s",
+                discord_user_id,
+                len(new_slips),
+                send_exc,
+            )
+
+
+async def _resolve_notify_channel(
+    bot: Bot,
+    notify_channel_id: int,
+) -> discord.abc.Messageable | None:
+    channel = bot.get_channel(notify_channel_id)
+    if isinstance(channel, discord.abc.Messageable):
+        return channel
+
+    try:
+        fetched = await bot.fetch_channel(notify_channel_id)
+    except Exception as exc:
+        logger.warning("Failed to fetch notify channel: channel_id=%s error=%s", notify_channel_id, exc)
+        return None
+    if isinstance(fetched, discord.abc.Messageable):
+        return fetched
+    logger.warning("Notify channel is not messageable: channel_id=%s type=%s", notify_channel_id, type(fetched).__name__)
+    return None
+
+
+async def _auto_notify_loop(
+    *,
+    bot: Bot,
+    state: AutoNotifyState,
+    notify_channel_id: int,
+    polling_interval_minutes: int,
+    fetch_recent_purchases: Callable[[str], Awaitable[list[BetSlip]]],
+) -> None:
+    interval_seconds = float(max(1, polling_interval_minutes)) * 60.0
+    notify_channel: discord.abc.Messageable | None = None
+
+    async def ensure_channel() -> discord.abc.Messageable | None:
+        nonlocal notify_channel
+        if notify_channel is not None:
+            return notify_channel
+        notify_channel = await _resolve_notify_channel(bot, notify_channel_id)
+        return notify_channel
+
+    async def send_new_purchases(discord_user_id: str, slips: list[BetSlip]) -> None:
+        channel = await ensure_channel()
+        if channel is None:
+            return
+        embeds = _build_compact_purchase_embeds(slips, mode_label="신규 구매")
+        await channel.send(content=_build_auto_notify_content(discord_user_id, len(slips)), embeds=embeds)
+
+    async def send_session_expired_notice(discord_user_id: str) -> None:
+        channel = await ensure_channel()
+        if channel is None:
+            return
+        await channel.send(_build_session_expired_content(discord_user_id))
+
+    await bot.wait_until_ready()
+    logger.info(
+        "Auto notify loop started: channel_id=%s interval_minutes=%d",
+        notify_channel_id,
+        polling_interval_minutes,
+    )
+    try:
+        while not bot.is_closed():
+            try:
+                await _run_auto_notify_cycle(
+                    state,
+                    fetch_recent_purchases=fetch_recent_purchases,
+                    send_new_purchases=send_new_purchases,
+                    send_session_expired_notice=send_session_expired_notice,
+                )
+            except Exception:
+                logger.exception("Auto notify cycle failed")
+            await asyncio.sleep(interval_seconds)
+    except asyncio.CancelledError:
+        logger.info("Auto notify loop cancelled")
+        raise
 
 
 def _session_state_path(discord_user_id: str) -> Path:
@@ -595,7 +950,7 @@ async def _resolve_purchases_with_cache(
         return slips
 
     try:
-        return await _run_session_refresh_task(session, "purchases:recent5", refresh)
+        return await _run_session_refresh_task(session, "purchases:recent", refresh)
     except Exception as exc:
         if _should_use_stale_cache_on_error(exc):
             now_retry = now_monotonic()
@@ -678,6 +1033,9 @@ async def main() -> None:
     token = os.environ.get("DISCORD_BOT_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_BOT_TOKEN is not set")
+    notify_channel_id = _parse_notify_channel_id(os.environ.get("DISCORD_CHANNEL_ID"))
+    polling_interval_minutes = _parse_polling_interval_minutes(os.environ.get("POLLING_INTERVAL_MINUTES"), default=5)
+    fake_purchases_file = os.environ.get("FAKE_PURCHASES_FILE")
 
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(headless=True)
@@ -689,11 +1047,17 @@ async def main() -> None:
     games_cache_at_monotonic: float | None = None
     games_refresh_task: asyncio.Task[SaleGamesSnapshot] | None = None
     games_lock = asyncio.Lock()
+    auto_notify_state = AutoNotifyState()
+    auto_notify_task: asyncio.Task[None] | None = None
 
     bot = Bot()
     bot.sync_guild_id = _parse_sync_guild_id(os.environ.get("DISCORD_GUILD_ID"))
     if bot.sync_guild_id is not None:
         logger.info("Guild slash command sync enabled. guild_id=%s", bot.sync_guild_id)
+    restored_user_ids = _restore_watch_user_ids_from_session_files()
+    if restored_user_ids:
+        auto_notify_state.watch_user_ids.update(restored_user_ids)
+        logger.info("Auto notify restored users from session files: count=%d", len(restored_user_ids))
 
     async def get_user_session(discord_user_id: str) -> UserSession:
         session = await _get_or_create_user_session(
@@ -709,6 +1073,7 @@ async def main() -> None:
     async def do_login(discord_user_id: str, user_id: str, user_pw: str) -> bool:
         session = await get_user_session(discord_user_id)
         start_keepalive = False
+        login_ok = False
         async with session.meta_lock:
             if session.closing:
                 return False
@@ -742,11 +1107,19 @@ async def main() -> None:
                         discord_user_id,
                         exc,
                     )
+            login_ok = ok
         if start_keepalive:
             await _start_keepalive_if_needed(session, discord_user_id)
-        return ok
+        if login_ok:
+            await _track_user_for_auto_notify(auto_notify_state, discord_user_id)
+        return login_ok
 
-    async def do_purchases(discord_user_id: str) -> list:
+    async def _fetch_recent_purchases_all(discord_user_id: str) -> list[BetSlip]:
+        fake_slips = _load_fake_purchases(fake_purchases_file, discord_user_id, limit=30)
+        if fake_slips is not None:
+            logger.info("Using fake purchases for testing: discord_user_id=%s count=%d", discord_user_id, len(fake_slips))
+            return fake_slips
+
         session = await get_user_session(discord_user_id)
         await _begin_user_request(session)
         try:
@@ -756,7 +1129,7 @@ async def main() -> None:
             async def probe_fetch() -> str:
                 page = await session.context.new_page()
                 try:
-                    return await probe_recent_purchases_token(page, limit=5)
+                    return await probe_recent_purchases_token(page, limit=30)
                 finally:
                     try:
                         await page.close()
@@ -766,7 +1139,7 @@ async def main() -> None:
             async def full_fetch() -> list[BetSlip]:
                 page = await session.context.new_page()
                 try:
-                    return await scrape_purchase_history(page, limit=5)
+                    return await scrape_purchase_history(page, limit=30)
                 finally:
                     try:
                         await page.close()
@@ -776,6 +1149,10 @@ async def main() -> None:
             return await _resolve_purchases_with_cache(session, probe_fetch=probe_fetch, full_fetch=full_fetch)
         finally:
             await _end_user_request(session)
+
+    async def do_purchases(discord_user_id: str) -> list[BetSlip]:
+        slips = await _fetch_recent_purchases_all(discord_user_id)
+        return slips[:5]
 
     async def do_analysis(discord_user_id: str, months: int) -> PurchaseAnalysis:
         session = await get_user_session(discord_user_id)
@@ -847,6 +1224,7 @@ async def main() -> None:
                             exc,
                         )
             _remove_user_session_files(discord_user_id)
+            await _untrack_user_for_auto_notify(auto_notify_state, discord_user_id)
             return True
         except Exception as exc:
             logger.exception("Logout failed: discord_user_id=%s error=%s", discord_user_id, exc)
@@ -934,9 +1312,30 @@ async def main() -> None:
     bot.games_callback = do_games
     bot.logout_callback = do_logout
 
+    if notify_channel_id is None:
+        logger.warning("Auto notify disabled: DISCORD_CHANNEL_ID is not set or invalid")
+    else:
+        auto_notify_task = asyncio.create_task(
+            _auto_notify_loop(
+                bot=bot,
+                state=auto_notify_state,
+                notify_channel_id=notify_channel_id,
+                polling_interval_minutes=polling_interval_minutes,
+                fetch_recent_purchases=_fetch_recent_purchases_all,
+            )
+        )
+
     try:
         await bot.start(token)
     finally:
+        if auto_notify_task is not None and not auto_notify_task.done():
+            auto_notify_task.cancel()
+            try:
+                await auto_notify_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
         async with sessions_lock:
             pending_creations = list(creating_sessions.values())
         for task in pending_creations:

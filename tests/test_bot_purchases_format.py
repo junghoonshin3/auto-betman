@@ -138,3 +138,9 @@ def test_compact_embed_chunks_when_too_long() -> None:
 
     embeds = _build_compact_purchase_embeds(slips)
     assert len(embeds) > 2
+
+
+def test_compact_embed_uses_custom_mode_label() -> None:
+    embeds = _build_compact_purchase_embeds([_sample_slip("적중")], mode_label="신규 구매")
+    assert embeds
+    assert embeds[0].title == "구매내역 조회 결과 (신규 구매)"

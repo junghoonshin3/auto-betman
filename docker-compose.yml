@@ -3,5 +3,7 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    environment:
+      FAKE_PURCHASES_FILE: /app/storage/fake_purchases.json
     volumes:
       - ./storage:/app/storage

@@ -335,8 +335,8 @@ def _build_slip_embed(index: int, slip: BetSlip) -> discord.Embed:
     return embed
 
 
-def _build_compact_purchase_embeds(slips: list[BetSlip]) -> list[discord.Embed]:
-    summary = _build_summary_embed(slips, "최근 5개")
+def _build_compact_purchase_embeds(slips: list[BetSlip], mode_label: str = "최근 5개") -> list[discord.Embed]:
+    summary = _build_summary_embed(slips, mode_label)
     lines: list[str] = []
 
     for idx, slip in enumerate(slips, start=1):
