@@ -17,7 +17,7 @@ from src import auth
 from src.analysis import probe_purchase_analysis_token, scrape_purchase_analysis
 from src.bot import Bot
 from src.games import scrape_sale_games_summary
-from src.models import BetSlip, PurchaseAnalysis, SaleGamesSnapshot
+from src.models import BetSlip, PurchaseAnalysis, SaleGameMatch, SaleGamesSnapshot
 from src.purchases import probe_recent_purchases_token, scrape_purchase_history
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,11 @@ KEEPALIVE_INTERVAL_SECONDS = 300.0
 KEEPALIVE_TIMEOUT_SECONDS = 25.0
 KEEPALIVE_TRANSIENT_RETRIES = 2
 _SESSION_EXPIRED_MESSAGE = "세션이 만료되었습니다. /login으로 다시 로그인해주세요."
+_GAMES_TYPE_LABEL_BY_OPTION = {
+    "victory": "승부식",
+    "record": "기록식",
+    "windrawlose": "승무패",
+}
 
 T = TypeVar("T")
 
@@ -455,6 +460,56 @@ def _should_use_stale_cache_on_error(exc: Exception) -> bool:
     return _is_transient_error_message(str(exc))
 
 
+def _normalize_games_filter_value(game_type: str | None) -> str:
+    value = str(game_type or "").strip().lower()
+    if value in _GAMES_TYPE_LABEL_BY_OPTION:
+        return value
+    if value == "all":
+        return "all"
+    return "all"
+
+
+def _dedupe_all_games_matches(matches: list[SaleGameMatch]) -> list[SaleGameMatch]:
+    deduped: list[SaleGameMatch] = []
+    seen_keys: set[tuple[object, ...]] = set()
+    for match in matches:
+        key = (
+            match.sport,
+            match.home_team,
+            match.away_team,
+            match.start_epoch_ms,
+            match.sale_end_epoch_ms,
+            match.round_label,
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(match)
+    return deduped
+
+
+def _filter_sale_games_snapshot(snapshot: SaleGamesSnapshot, game_type: str) -> SaleGamesSnapshot:
+    normalized = _normalize_games_filter_value(game_type)
+    if normalized == "all":
+        filtered_matches = _dedupe_all_games_matches(snapshot.nearest_matches)
+    else:
+        target_type = _GAMES_TYPE_LABEL_BY_OPTION[normalized]
+        filtered_matches = [match for match in snapshot.nearest_matches if match.game_type == target_type]
+    sport_counts: dict[str, int] = {}
+    for match in filtered_matches:
+        sport_counts[match.sport] = sport_counts.get(match.sport, 0) + 1
+    game_keys = {(match.gm_id, match.gm_ts) for match in filtered_matches}
+
+    return SaleGamesSnapshot(
+        fetched_at=snapshot.fetched_at,
+        total_games=len(game_keys),
+        total_matches=len(filtered_matches),
+        sport_counts=dict(sorted(sport_counts.items(), key=lambda kv: kv[0])),
+        nearest_matches=filtered_matches,
+        partial_failures=snapshot.partial_failures,
+    )
+
+
 async def _run_session_refresh_task(
     session: UserSession,
     key: str,
@@ -778,10 +833,12 @@ async def main() -> None:
             logger.exception("Logout failed: discord_user_id=%s error=%s", discord_user_id, exc)
             return False
 
-    async def do_games() -> SaleGamesSnapshot:
+    async def do_games(game_type: str) -> SaleGamesSnapshot:
         nonlocal games_cache
         nonlocal games_cache_at_monotonic
         nonlocal games_refresh_task
+
+        normalized_type = _normalize_games_filter_value(game_type)
 
         now = time.monotonic()
         task: asyncio.Task[SaleGamesSnapshot]
@@ -789,8 +846,8 @@ async def main() -> None:
             if games_cache is not None and games_cache_at_monotonic is not None:
                 age = now - games_cache_at_monotonic
                 if age <= CACHE_TTL_SECONDS:
-                    logger.info("games cache hit: age=%.2fs", age)
-                    return games_cache
+                    logger.info("games cache hit: type=%s age=%.2fs", normalized_type, age)
+                    return _filter_sale_games_snapshot(games_cache, normalized_type)
 
             if games_refresh_task is None or games_refresh_task.done():
                 async def refresh_games() -> SaleGamesSnapshot:
@@ -805,7 +862,7 @@ async def main() -> None:
                     try:
                         await stealth.apply_stealth_async(context)
                         page = await context.new_page()
-                        return await scrape_sale_games_summary(page, nearest_limit=20)
+                        return await scrape_sale_games_summary(page, nearest_limit=None)
                     finally:
                         if page is not None:
                             try:
@@ -830,7 +887,7 @@ async def main() -> None:
                 games_cache_at_monotonic = time.monotonic()
                 if games_refresh_task is task:
                     games_refresh_task = None
-            return snapshot
+            return _filter_sale_games_snapshot(snapshot, normalized_type)
         except Exception as exc:
             async with games_lock:
                 if games_refresh_task is task:
@@ -848,7 +905,7 @@ async def main() -> None:
                 and _should_use_stale_cache_on_error(exc)
             ):
                 logger.warning("games stale cache used due to transient error: age=%.2fs error=%s", stale_age, exc)
-                return stale
+                return _filter_sale_games_snapshot(stale, normalized_type)
             raise
 
     bot.login_callback = do_login

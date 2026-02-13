@@ -48,16 +48,15 @@ class PurchaseAnalysis:
 class SaleGameMatch:
     gm_id: str
     gm_ts: str
-    game_name: str
+    game_type: str
     sport: str
-    league: str
+    match_name: str
+    round_label: str
     match_seq: int
     home_team: str
     away_team: str
-    bet_type: str
-    odds_home: float | None
-    odds_draw: float | None
-    odds_away: float | None
+    start_at: str
+    start_epoch_ms: int | None
     sale_end_at: str
     sale_end_epoch_ms: int | None
     status: str

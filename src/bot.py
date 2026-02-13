@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
 from pathlib import Path
@@ -205,38 +206,57 @@ def _build_games_summary_embed(snapshot: SaleGamesSnapshot) -> discord.Embed:
         embed.add_field(name="종목별 경기수", value="\n".join(sport_lines)[:1024], inline=False)
     else:
         embed.add_field(name="종목별 경기수", value="-", inline=False)
-
-    nearest_lines: list[str] = []
-    for idx, match in enumerate(snapshot.nearest_matches, start=1):
-        team_text = f"{match.home_team} vs {match.away_team}".strip()
-        nearest_lines.append(f"{idx}. [{match.sport}] {team_text} · {match.bet_type} · 마감 {match.sale_end_at or '-'}")
-
-    if nearest_lines:
-        max_desc = 3900
-        chunks: list[str] = []
-        current = ""
-        for line in nearest_lines:
-            candidate = line if not current else f"{current}\n{line}"
-            if len(candidate) > max_desc:
-                chunks.append(current)
-                current = line
-            else:
-                current = candidate
-        if current:
-            chunks.append(current)
-
-        if chunks:
-            embed.description = f"마감 임박 {len(snapshot.nearest_matches)}경기\n\n{chunks[0]}"
-            for i, chunk in enumerate(chunks[1:], start=2):
-                field_name = f"마감 임박 경기 (계속 {i})"
-                embed.add_field(name=field_name, value=chunk[:1024], inline=False)
-    else:
-        embed.description = "마감 임박 경기 데이터가 없습니다."
-
     if snapshot.partial_failures > 0:
         embed.add_field(name="부분 실패", value=f"{snapshot.partial_failures}개 게임 상세 수집 실패", inline=False)
 
     return embed
+
+
+def _build_games_lines(snapshot: SaleGamesSnapshot) -> list[str]:
+    lines: list[str] = []
+    for idx, match in enumerate(snapshot.nearest_matches, start=1):
+        sport = (match.sport or "").strip() or "기타"
+        match_name = (match.match_name or "").strip() or "홈팀 미상 vs 원정팀 미상"
+        round_label = (match.round_label or "").strip() or "회차 미상"
+        start_at = (match.start_at or "").strip() or "-"
+        sale_end_at = (match.sale_end_at or "").strip() or "-"
+        lines.append(
+            f"{idx}. [{sport}] {match_name} · {round_label} · 시작 {start_at} · 마감 {sale_end_at}"
+        )
+    return lines
+
+
+def _build_games_message(snapshot: SaleGamesSnapshot) -> tuple[discord.Embed, discord.File | None]:
+    embed = _build_games_summary_embed(snapshot)
+    lines = _build_games_lines(snapshot)
+    if lines:
+        all_text = "\n".join(lines)
+        # Keep embed readable and attach full list when too long.
+        if len(all_text) <= 3500:
+            embed.description = f"발매중 경기 {len(lines)}건\n\n{all_text}"
+            file_obj: discord.File | None = None
+        else:
+            preview = ""
+            for line in lines:
+                candidate = line if not preview else f"{preview}\n{line}"
+                if len(candidate) > 3000:
+                    break
+                preview = candidate
+            embed.description = (
+                f"발매중 경기 {len(lines)}건\n\n"
+                f"{preview}\n\n"
+                "전체 목록은 첨부파일을 확인해주세요."
+            )
+            stamp = snapshot.fetched_at.replace(".", "").replace(":", "").replace(" ", "_")
+            file_obj = discord.File(
+                io.BytesIO(all_text.encode("utf-8")),
+                filename=f"games_{stamp}.txt",
+            )
+    else:
+        embed.description = "발매중 경기 데이터가 없습니다."
+        file_obj = None
+
+    return embed, file_obj
 
 
 def _build_slip_embed(index: int, slip: BetSlip) -> discord.Embed:
@@ -357,7 +377,7 @@ class Bot(discord.Client):
         self.login_callback: Callable[[str, str, str], Awaitable[bool]] | None = None
         self.purchase_callback: Callable[[str], Awaitable[list[BetSlip]]] | None = None
         self.analysis_callback: Callable[[str, int], Awaitable[PurchaseAnalysis]] | None = None
-        self.games_callback: Callable[[], Awaitable[SaleGamesSnapshot]] | None = None
+        self.games_callback: Callable[[str], Awaitable[SaleGamesSnapshot]] | None = None
         self.logout_callback: Callable[[str], Awaitable[bool]] | None = None
         self.sync_guild_id: int | None = None
 
@@ -435,20 +455,41 @@ class Bot(discord.Client):
             await interaction.followup.send(embed=_build_analysis_embed(result))
 
         @self.tree.command(name="games", description="발매중 전체 경기 요약 조회")
-        async def games_command(interaction: discord.Interaction) -> None:
+        @app_commands.describe(game_type="게임 타입 필터 (기본: 승무패)")
+        @app_commands.choices(
+            game_type=[
+                app_commands.Choice(name="승무패", value="windrawlose"),
+                app_commands.Choice(name="승부식", value="victory"),
+                app_commands.Choice(name="기록식", value="record"),
+                app_commands.Choice(name="전체", value="all"),
+            ]
+        )
+        async def games_command(
+            interaction: discord.Interaction,
+            game_type: app_commands.Choice[str] | None = None,
+        ) -> None:
             if self.games_callback is None:
                 await interaction.response.send_message("경기 조회 기능이 준비되지 않았습니다.", ephemeral=True)
                 return
 
             await interaction.response.defer(thinking=True)
+            selected_type = game_type.value if game_type is not None else "windrawlose"
             try:
-                snapshot = await self.games_callback()
+                snapshot = await self.games_callback(selected_type)
             except Exception as exc:
                 logger.exception("Failed to scrape sale games")
                 await interaction.followup.send(f"경기 조회 실패: {exc}")
                 return
 
-            await interaction.followup.send(embed=_build_games_summary_embed(snapshot))
+            if snapshot.total_matches <= 0:
+                await interaction.followup.send("선택한 타입의 발매중 경기가 없습니다.")
+                return
+
+            embed, file_obj = _build_games_message(snapshot)
+            if file_obj is not None:
+                await interaction.followup.send(embed=embed, file=file_obj)
+            else:
+                await interaction.followup.send(embed=embed)
 
         @self.tree.command(name="logout", description="베트맨 로그아웃")
         async def logout_command(interaction: discord.Interaction) -> None:

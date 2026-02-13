@@ -10,10 +10,11 @@ from src.main import (
     AnalysisCacheEntry,
     PurchasesCacheEntry,
     UserSession,
+    _filter_sale_games_snapshot,
     _resolve_analysis_with_cache,
     _resolve_purchases_with_cache,
 )
-from src.models import BetSlip, MatchBet, PurchaseAnalysis
+from src.models import BetSlip, MatchBet, PurchaseAnalysis, SaleGameMatch, SaleGamesSnapshot
 
 
 def _sample_slips() -> list[BetSlip]:
@@ -51,6 +52,98 @@ def _session() -> UserSession:
         login_ok=True,
         storage_state_path=Path("/tmp/session.json"),
         meta_lock=asyncio.Lock(),
+    )
+
+
+def _games_snapshot() -> SaleGamesSnapshot:
+    return SaleGamesSnapshot(
+        fetched_at="2026.02.14 10:00:00",
+        total_games=4,
+        total_matches=5,
+        sport_counts={"농구": 2, "축구": 3},
+        nearest_matches=[
+            SaleGameMatch(
+                gm_id="G101",
+                gm_ts="1001",
+                game_type="승부식",
+                sport="축구",
+                match_name="A vs B",
+                round_label="1회차",
+                match_seq=1,
+                home_team="A",
+                away_team="B",
+                start_at="02.14 12:00",
+                start_epoch_ms=1,
+                sale_end_at="02.14 11:00",
+                sale_end_epoch_ms=1,
+                status="발매중",
+            ),
+            SaleGameMatch(
+                gm_id="G102",
+                gm_ts="1002",
+                game_type="기록식",
+                sport="축구",
+                match_name="A vs B",
+                round_label="1회차",
+                match_seq=2,
+                home_team="A",
+                away_team="B",
+                start_at="02.14 12:00",
+                start_epoch_ms=1,
+                sale_end_at="02.14 11:00",
+                sale_end_epoch_ms=1,
+                status="발매중",
+            ),
+            SaleGameMatch(
+                gm_id="G102",
+                gm_ts="1002",
+                game_type="기록식",
+                sport="농구",
+                match_name="C vs D",
+                round_label="2회차",
+                match_seq=3,
+                home_team="C",
+                away_team="D",
+                start_at="02.14 13:00",
+                start_epoch_ms=2,
+                sale_end_at="02.14 12:00",
+                sale_end_epoch_ms=2,
+                status="발매중",
+            ),
+            SaleGameMatch(
+                gm_id="G011",
+                gm_ts="1003",
+                game_type="승무패",
+                sport="축구",
+                match_name="E vs F",
+                round_label="3회차",
+                match_seq=4,
+                home_team="E",
+                away_team="F",
+                start_at="02.14 14:00",
+                start_epoch_ms=3,
+                sale_end_at="02.14 13:00",
+                sale_end_epoch_ms=3,
+                status="발매중",
+            ),
+            SaleGameMatch(
+                gm_id="G101",
+                gm_ts="1001",
+                game_type="승부식",
+                sport="축구",
+                match_name="G vs H",
+                round_label="1회차",
+                match_seq=5,
+                home_team="G",
+                away_team="H",
+                start_at="02.14 15:00",
+                start_epoch_ms=4,
+                sale_end_at="02.14 14:00",
+                sale_end_epoch_ms=4,
+                status="발매중",
+            ),
+        ],
+        partial_failures=0,
     )
 
 
@@ -211,3 +304,30 @@ async def test_analysis_does_not_return_stale_cache_when_session_expired() -> No
 
     with pytest.raises(RuntimeError, match="세션이 만료되었습니다"):
         await _resolve_analysis_with_cache(session, 1, probe, full, now_monotonic=lambda: 120.0)
+
+
+def test_filter_sale_games_snapshot_victory_recalculates_counts() -> None:
+    snapshot = _games_snapshot()
+
+    filtered = _filter_sale_games_snapshot(snapshot, "victory")
+    assert filtered.total_matches == 2
+    assert filtered.total_games == 1
+    assert filtered.sport_counts == {"축구": 2}
+    assert all(match.game_type == "승부식" for match in filtered.nearest_matches)
+
+
+def test_filter_sale_games_snapshot_all_dedupes_across_types() -> None:
+    snapshot = _games_snapshot()
+    filtered = _filter_sale_games_snapshot(snapshot, "all")
+    assert filtered is not snapshot
+    assert filtered.total_matches == 4
+    assert filtered.total_games == 3
+    assert filtered.sport_counts == {"농구": 1, "축구": 3}
+    assert len(filtered.nearest_matches) == 4
+
+
+def test_filter_sale_games_snapshot_invalid_defaults_to_all() -> None:
+    snapshot = _games_snapshot()
+    filtered = _filter_sale_games_snapshot(snapshot, "unknown")
+    assert filtered.total_matches == 4
+    assert filtered.total_games == 3

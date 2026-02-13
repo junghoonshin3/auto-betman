@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from discord import app_commands
+
 from src.bot import Bot
 from src.models import BetSlip, PurchaseAnalysis, SaleGamesSnapshot
 
@@ -89,7 +91,31 @@ async def test_games_command_sends_public_message() -> None:
     interaction = _make_interaction(999)
     await command.callback(interaction)
 
-    bot.games_callback.assert_awaited_once_with()
+    bot.games_callback.assert_awaited_once_with("windrawlose")
     interaction.response.defer.assert_awaited_once_with(thinking=True)
     kwargs = interaction.followup.send.await_args.kwargs
     assert "ephemeral" not in kwargs
+
+
+async def test_games_command_passes_selected_game_type() -> None:
+    bot = Bot()
+    bot._sync_application_commands = AsyncMock()  # type: ignore[method-assign]
+    bot.games_callback = AsyncMock(
+        return_value=SaleGamesSnapshot(
+            fetched_at="2026.02.13 19:00:00",
+            total_games=1,
+            total_matches=1,
+            sport_counts={"축구": 1},
+            nearest_matches=[],
+            partial_failures=0,
+        )
+    )
+
+    await bot.setup_hook()
+    command = bot.tree.get_command("games")
+    assert command is not None
+
+    interaction = _make_interaction(999)
+    await command.callback(interaction, app_commands.Choice(name="기록식", value="record"))
+
+    bot.games_callback.assert_awaited_once_with("record")
