@@ -38,6 +38,19 @@ _MATCH_RESULT_ICON = {
     "적중": "✅",
     "미적중": "❌",
 }
+_GAME_TYPE_LABEL_BY_VALUE = {
+    "windrawlose": "승무패",
+    "victory": "승부식",
+    "record": "기록식",
+    "all": "전체",
+}
+_SPORT_LABEL_BY_VALUE = {
+    "all": "전체",
+    "soccer": "축구",
+    "baseball": "야구",
+    "basketball": "농구",
+    "volleyball": "배구",
+}
 
 
 def _load_login_id_map(path: Path = LOGIN_ID_MAP_PATH) -> dict[str, str]:
@@ -193,11 +206,17 @@ def _build_analysis_embed(result: PurchaseAnalysis) -> discord.Embed:
     return embed
 
 
-def _build_games_summary_embed(snapshot: SaleGamesSnapshot) -> discord.Embed:
+def _build_games_summary_embed(
+    snapshot: SaleGamesSnapshot,
+    selected_type_label: str,
+    selected_sport_label: str,
+) -> discord.Embed:
     embed = discord.Embed(
         title="발매중 전체 경기 요약",
         colour=discord.Color.green(),
     )
+    embed.add_field(name="조회 타입", value=selected_type_label, inline=False)
+    embed.add_field(name="조회 종목", value=selected_sport_label, inline=False)
     embed.add_field(name="수집시각", value=snapshot.fetched_at, inline=False)
     embed.add_field(name="전체 게임/전체 경기", value=f"{snapshot.total_games} / {snapshot.total_matches}", inline=False)
 
@@ -217,17 +236,22 @@ def _build_games_lines(snapshot: SaleGamesSnapshot) -> list[str]:
     for idx, match in enumerate(snapshot.nearest_matches, start=1):
         sport = (match.sport or "").strip() or "기타"
         match_name = (match.match_name or "").strip() or "홈팀 미상 vs 원정팀 미상"
+        game_type = (match.game_type or "").strip() or "-"
         round_label = (match.round_label or "").strip() or "회차 미상"
         start_at = (match.start_at or "").strip() or "-"
         sale_end_at = (match.sale_end_at or "").strip() or "-"
         lines.append(
-            f"{idx}. [{sport}] {match_name} · {round_label} · 시작 {start_at} · 마감 {sale_end_at}"
+            f"{idx}. [{sport}] {match_name} · 유형 {game_type} · {round_label} · 시작 {start_at} · 마감 {sale_end_at}"
         )
     return lines
 
 
-def _build_games_message(snapshot: SaleGamesSnapshot) -> tuple[discord.Embed, discord.File | None]:
-    embed = _build_games_summary_embed(snapshot)
+def _build_games_message(
+    snapshot: SaleGamesSnapshot,
+    selected_type_label: str,
+    selected_sport_label: str,
+) -> tuple[discord.Embed, discord.File | None]:
+    embed = _build_games_summary_embed(snapshot, selected_type_label, selected_sport_label)
     lines = _build_games_lines(snapshot)
     if lines:
         all_text = "\n".join(lines)
@@ -377,7 +401,7 @@ class Bot(discord.Client):
         self.login_callback: Callable[[str, str, str], Awaitable[bool]] | None = None
         self.purchase_callback: Callable[[str], Awaitable[list[BetSlip]]] | None = None
         self.analysis_callback: Callable[[str, int], Awaitable[PurchaseAnalysis]] | None = None
-        self.games_callback: Callable[[str], Awaitable[SaleGamesSnapshot]] | None = None
+        self.games_callback: Callable[[str, str], Awaitable[SaleGamesSnapshot]] | None = None
         self.logout_callback: Callable[[str], Awaitable[bool]] | None = None
         self.sync_guild_id: int | None = None
 
@@ -455,37 +479,53 @@ class Bot(discord.Client):
             await interaction.followup.send(embed=_build_analysis_embed(result))
 
         @self.tree.command(name="games", description="발매중 전체 경기 요약 조회")
-        @app_commands.describe(game_type="게임 타입 필터 (기본: 승무패)")
+        @app_commands.describe(
+            game_type="게임 타입 필터 (기본: 승부식)",
+            sport="스포츠 종목 필터 (기본: 전체)",
+        )
         @app_commands.choices(
             game_type=[
-                app_commands.Choice(name="승무패", value="windrawlose"),
                 app_commands.Choice(name="승부식", value="victory"),
+                app_commands.Choice(name="승무패", value="windrawlose"),
                 app_commands.Choice(name="기록식", value="record"),
                 app_commands.Choice(name="전체", value="all"),
-            ]
+            ],
+            sport=[
+                app_commands.Choice(name="전체", value="all"),
+                app_commands.Choice(name="축구", value="soccer"),
+                app_commands.Choice(name="야구", value="baseball"),
+                app_commands.Choice(name="농구", value="basketball"),
+                app_commands.Choice(name="배구", value="volleyball"),
+            ],
         )
         async def games_command(
             interaction: discord.Interaction,
             game_type: app_commands.Choice[str] | None = None,
+            sport: app_commands.Choice[str] | None = None,
         ) -> None:
             if self.games_callback is None:
                 await interaction.response.send_message("경기 조회 기능이 준비되지 않았습니다.", ephemeral=True)
                 return
 
             await interaction.response.defer(thinking=True)
-            selected_type = game_type.value if game_type is not None else "windrawlose"
+            selected_type = game_type.value if game_type is not None else "victory"
+            selected_sport = sport.value if sport is not None else "all"
+            selected_type_label = _GAME_TYPE_LABEL_BY_VALUE.get(selected_type, "전체")
+            selected_sport_label = _SPORT_LABEL_BY_VALUE.get(selected_sport, "전체")
             try:
-                snapshot = await self.games_callback(selected_type)
+                snapshot = await self.games_callback(selected_type, selected_sport)
             except Exception as exc:
                 logger.exception("Failed to scrape sale games")
                 await interaction.followup.send(f"경기 조회 실패: {exc}")
                 return
 
             if snapshot.total_matches <= 0:
-                await interaction.followup.send("선택한 타입의 발매중 경기가 없습니다.")
+                await interaction.followup.send(
+                    f"조회 타입({selected_type_label}), 종목({selected_sport_label})의 발매중 경기가 없습니다."
+                )
                 return
 
-            embed, file_obj = _build_games_message(snapshot)
+            embed, file_obj = _build_games_message(snapshot, selected_type_label, selected_sport_label)
             if file_obj is not None:
                 await interaction.followup.send(embed=embed, file=file_obj)
             else:

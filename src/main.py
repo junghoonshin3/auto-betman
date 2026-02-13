@@ -35,6 +35,12 @@ _GAMES_TYPE_LABEL_BY_OPTION = {
     "record": "기록식",
     "windrawlose": "승무패",
 }
+_GAMES_SPORT_LABEL_BY_OPTION = {
+    "soccer": "축구",
+    "baseball": "야구",
+    "basketball": "농구",
+    "volleyball": "배구",
+}
 
 T = TypeVar("T")
 
@@ -469,6 +475,15 @@ def _normalize_games_filter_value(game_type: str | None) -> str:
     return "all"
 
 
+def _normalize_games_sport_filter_value(sport: str | None) -> str:
+    value = str(sport or "").strip().lower()
+    if value in _GAMES_SPORT_LABEL_BY_OPTION:
+        return value
+    if value == "all":
+        return "all"
+    return "all"
+
+
 def _dedupe_all_games_matches(matches: list[SaleGameMatch]) -> list[SaleGameMatch]:
     deduped: list[SaleGameMatch] = []
     seen_keys: set[tuple[object, ...]] = set()
@@ -488,13 +503,17 @@ def _dedupe_all_games_matches(matches: list[SaleGameMatch]) -> list[SaleGameMatc
     return deduped
 
 
-def _filter_sale_games_snapshot(snapshot: SaleGamesSnapshot, game_type: str) -> SaleGamesSnapshot:
+def _filter_sale_games_snapshot(snapshot: SaleGamesSnapshot, game_type: str, sport: str) -> SaleGamesSnapshot:
     normalized = _normalize_games_filter_value(game_type)
+    normalized_sport = _normalize_games_sport_filter_value(sport)
     if normalized == "all":
         filtered_matches = _dedupe_all_games_matches(snapshot.nearest_matches)
     else:
         target_type = _GAMES_TYPE_LABEL_BY_OPTION[normalized]
         filtered_matches = [match for match in snapshot.nearest_matches if match.game_type == target_type]
+    if normalized_sport != "all":
+        target_sport = _GAMES_SPORT_LABEL_BY_OPTION[normalized_sport]
+        filtered_matches = [match for match in filtered_matches if match.sport == target_sport]
     sport_counts: dict[str, int] = {}
     for match in filtered_matches:
         sport_counts[match.sport] = sport_counts.get(match.sport, 0) + 1
@@ -833,12 +852,13 @@ async def main() -> None:
             logger.exception("Logout failed: discord_user_id=%s error=%s", discord_user_id, exc)
             return False
 
-    async def do_games(game_type: str) -> SaleGamesSnapshot:
+    async def do_games(game_type: str, sport: str) -> SaleGamesSnapshot:
         nonlocal games_cache
         nonlocal games_cache_at_monotonic
         nonlocal games_refresh_task
 
         normalized_type = _normalize_games_filter_value(game_type)
+        normalized_sport = _normalize_games_sport_filter_value(sport)
 
         now = time.monotonic()
         task: asyncio.Task[SaleGamesSnapshot]
@@ -846,8 +866,8 @@ async def main() -> None:
             if games_cache is not None and games_cache_at_monotonic is not None:
                 age = now - games_cache_at_monotonic
                 if age <= CACHE_TTL_SECONDS:
-                    logger.info("games cache hit: type=%s age=%.2fs", normalized_type, age)
-                    return _filter_sale_games_snapshot(games_cache, normalized_type)
+                    logger.info("games cache hit: type=%s sport=%s age=%.2fs", normalized_type, normalized_sport, age)
+                    return _filter_sale_games_snapshot(games_cache, normalized_type, normalized_sport)
 
             if games_refresh_task is None or games_refresh_task.done():
                 async def refresh_games() -> SaleGamesSnapshot:
@@ -887,7 +907,7 @@ async def main() -> None:
                 games_cache_at_monotonic = time.monotonic()
                 if games_refresh_task is task:
                     games_refresh_task = None
-            return _filter_sale_games_snapshot(snapshot, normalized_type)
+            return _filter_sale_games_snapshot(snapshot, normalized_type, normalized_sport)
         except Exception as exc:
             async with games_lock:
                 if games_refresh_task is task:
@@ -905,7 +925,7 @@ async def main() -> None:
                 and _should_use_stale_cache_on_error(exc)
             ):
                 logger.warning("games stale cache used due to transient error: age=%.2fs error=%s", stale_age, exc)
-                return _filter_sale_games_snapshot(stale, normalized_type)
+                return _filter_sale_games_snapshot(stale, normalized_type, normalized_sport)
             raise
 
     bot.login_callback = do_login

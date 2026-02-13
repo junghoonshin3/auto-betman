@@ -309,7 +309,7 @@ async def test_analysis_does_not_return_stale_cache_when_session_expired() -> No
 def test_filter_sale_games_snapshot_victory_recalculates_counts() -> None:
     snapshot = _games_snapshot()
 
-    filtered = _filter_sale_games_snapshot(snapshot, "victory")
+    filtered = _filter_sale_games_snapshot(snapshot, "victory", "all")
     assert filtered.total_matches == 2
     assert filtered.total_games == 1
     assert filtered.sport_counts == {"축구": 2}
@@ -318,7 +318,7 @@ def test_filter_sale_games_snapshot_victory_recalculates_counts() -> None:
 
 def test_filter_sale_games_snapshot_all_dedupes_across_types() -> None:
     snapshot = _games_snapshot()
-    filtered = _filter_sale_games_snapshot(snapshot, "all")
+    filtered = _filter_sale_games_snapshot(snapshot, "all", "all")
     assert filtered is not snapshot
     assert filtered.total_matches == 4
     assert filtered.total_games == 3
@@ -328,6 +328,29 @@ def test_filter_sale_games_snapshot_all_dedupes_across_types() -> None:
 
 def test_filter_sale_games_snapshot_invalid_defaults_to_all() -> None:
     snapshot = _games_snapshot()
-    filtered = _filter_sale_games_snapshot(snapshot, "unknown")
+    filtered = _filter_sale_games_snapshot(snapshot, "unknown", "all")
     assert filtered.total_matches == 4
     assert filtered.total_games == 3
+
+
+def test_filter_sale_games_snapshot_applies_sport_and_game_type_and_mode() -> None:
+    snapshot = _games_snapshot()
+
+    victory_soccer = _filter_sale_games_snapshot(snapshot, "victory", "soccer")
+    assert victory_soccer.total_matches == 2
+    assert victory_soccer.sport_counts == {"축구": 2}
+    assert all(match.game_type == "승부식" for match in victory_soccer.nearest_matches)
+    assert all(match.sport == "축구" for match in victory_soccer.nearest_matches)
+
+    all_basketball = _filter_sale_games_snapshot(snapshot, "all", "basketball")
+    assert all_basketball.total_matches == 1
+    assert all_basketball.total_games == 1
+    assert all_basketball.sport_counts == {"농구": 1}
+    assert all(match.sport == "농구" for match in all_basketball.nearest_matches)
+
+
+def test_filter_sale_games_snapshot_invalid_sport_defaults_to_all() -> None:
+    snapshot = _games_snapshot()
+    filtered = _filter_sale_games_snapshot(snapshot, "victory", "unknown-sport")
+    assert filtered.total_matches == 2
+    assert filtered.total_games == 1

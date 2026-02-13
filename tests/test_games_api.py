@@ -234,6 +234,77 @@ async def test_scrape_sale_games_summary_applies_nearest_limit() -> None:
     assert snapshot.nearest_matches[1].match_seq == 1
 
 
+async def test_scrape_sale_games_summary_retries_list_api_then_succeeds() -> None:
+    page = _FakePage(
+        endpoint_responses={
+            "/buyPsblGame/inqCacheBuyAbleGameInfoList.do": [
+                {"__timeout": True},
+                {"protoGames": [{"gmId": "G101", "gmTs": 260019, "gmOsidTs": 19, "gameMaster": {"gameNickName": "승부식"}}], "totoGames": []},
+            ],
+            "/buyPsblGame/gameInfoInq.do": [
+                {
+                    "data": {
+                        "dl_schedulesList": [
+                            {"matchSeq": 1, "mchSportCd": "SC", "homeName": "A", "awayName": "B", "protoStatus": "2", "endDate": 1760000000000}
+                        ]
+                    }
+                }
+            ],
+        }
+    )
+
+    snapshot = await scrape_sale_games_summary(page, nearest_limit=None)
+    assert snapshot.total_matches == 1
+    assert snapshot.partial_failures == 0
+
+
+async def test_scrape_sale_games_summary_retries_detail_api_then_succeeds() -> None:
+    page = _FakePage(
+        endpoint_responses={
+            "/buyPsblGame/inqCacheBuyAbleGameInfoList.do": [
+                {"protoGames": [{"gmId": "G101", "gmTs": 260019, "gmOsidTs": 19, "gameMaster": {"gameNickName": "승부식"}}], "totoGames": []}
+            ],
+            "/buyPsblGame/gameInfoInq.do": [
+                {"__timeout": True},
+                {"__error": "temporary"},
+                {
+                    "data": {
+                        "dl_schedulesList": [
+                            {"matchSeq": 1, "mchSportCd": "SC", "homeName": "A", "awayName": "B", "protoStatus": "2", "endDate": 1760000000000}
+                        ]
+                    }
+                },
+            ],
+        }
+    )
+
+    snapshot = await scrape_sale_games_summary(page, nearest_limit=None)
+    assert snapshot.total_matches == 1
+    assert snapshot.partial_failures == 0
+
+
+async def test_scrape_sale_games_summary_counts_partial_failure_after_retry_exhausted() -> None:
+    page = _FakePage(
+        endpoint_responses={
+            "/buyPsblGame/inqCacheBuyAbleGameInfoList.do": [
+                {"protoGames": [{"gmId": "G101", "gmTs": 260019, "gmOsidTs": 19, "gameMaster": {"gameNickName": "승부식"}}], "totoGames": []}
+            ],
+            "/buyPsblGame/gameInfoInq.do": [
+                {"__timeout": True},
+                {"__error": "temporary-1"},
+                {"__error": "temporary-2"},
+                {"__timeout": True},
+                {"__error": "temporary-3"},
+                {"__error": "temporary-4"},
+            ],
+        }
+    )
+
+    snapshot = await scrape_sale_games_summary(page, nearest_limit=None)
+    assert snapshot.total_matches == 0
+    assert snapshot.partial_failures == 1
+
+
 async def test_scrape_sale_games_summary_reads_marking_data_and_retries_alt_params() -> None:
     page = _FakePage(
         endpoint_responses={

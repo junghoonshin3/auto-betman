@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections import Counter
@@ -14,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 _BUYABLE_GAME_LIST_PATH = "/main/mainPage/gamebuy/buyableGameList.do"
+_REQUEST_RETRIES = 2
+_REQUEST_BASE_DELAY_SECONDS = 0.4
 
 _SPORT_NAME_BY_CODE = {
     "SC": "축구",
@@ -471,6 +474,44 @@ async def _request_post_method(page: Page, endpoint: str, params: dict[str, Any]
     )
 
 
+def _is_request_payload_ok(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("__timeout"):
+        return False
+    if payload.get("__error"):
+        return False
+    return True
+
+
+async def _request_post_with_retry(
+    page: Page,
+    endpoint: str,
+    params: dict[str, Any],
+    retries: int = _REQUEST_RETRIES,
+    base_delay: float = _REQUEST_BASE_DELAY_SECONDS,
+) -> Any:
+    last_payload: Any = None
+    max_attempts = max(1, int(retries) + 1)
+    for attempt in range(1, max_attempts + 1):
+        payload = await _request_post_method(page, endpoint, params)
+        last_payload = payload
+        if _is_request_payload_ok(payload):
+            if attempt > 1:
+                logger.info("games request recovered: endpoint=%s attempt=%d/%d", endpoint, attempt, max_attempts)
+            return payload
+        logger.warning(
+            "games request failed: endpoint=%s attempt=%d/%d reason=%s",
+            endpoint,
+            attempt,
+            max_attempts,
+            payload,
+        )
+        if attempt < max_attempts:
+            await asyncio.sleep(max(0.05, float(base_delay) * attempt))
+    return last_payload
+
+
 async def _navigate_to_buyable_game_list(page: Page) -> None:
     try:
         await page.evaluate(f"movePageUrl('{_BUYABLE_GAME_LIST_PATH}')")
@@ -488,7 +529,7 @@ async def scrape_sale_games_summary(page: Page, nearest_limit: int | None = None
         timeout=10000,
     )
 
-    list_payload = await _request_post_method(page, "/buyPsblGame/inqCacheBuyAbleGameInfoList.do", {})
+    list_payload = await _request_post_with_retry(page, "/buyPsblGame/inqCacheBuyAbleGameInfoList.do", {})
     if not isinstance(list_payload, dict):
         raise RuntimeError("games list api failed: non-dict response")
     if list_payload.get("__error"):
@@ -520,7 +561,7 @@ async def scrape_sale_games_summary(page: Page, nearest_limit: int | None = None
         last_failure: Any = None
         for params in _build_game_detail_params_candidates(game_row):
             gm_key = f"{params.get('gmId', '')}:{params.get('gmTs', '')}"
-            detail_payload = await _request_post_method(page, "/buyPsblGame/gameInfoInq.do", params)
+            detail_payload = await _request_post_with_retry(page, "/buyPsblGame/gameInfoInq.do", params)
             if not isinstance(detail_payload, dict) or detail_payload.get("__error") or detail_payload.get("__timeout"):
                 last_failure = detail_payload
                 logger.warning("games detail api failed: gm=%s reason=%s", gm_key, detail_payload)
