@@ -20,7 +20,7 @@ from src.analysis import probe_purchase_analysis_token, scrape_purchase_analysis
 from src.bot import Bot, _build_compact_purchase_embeds
 from src.games import scrape_sale_games_summary
 from src.models import BetSlip, MatchBet, PurchaseAnalysis, SaleGameMatch, SaleGamesSnapshot
-from src.purchases import probe_recent_purchases_token, scrape_purchase_history
+from src.purchases import capture_purchase_paper_area_snapshots, probe_recent_purchases_token, scrape_purchase_history
 
 logger = logging.getLogger(__name__)
 SESSION_DIR = Path("storage")
@@ -31,6 +31,8 @@ CACHE_MAX_STALE_SECONDS = 600.0
 KEEPALIVE_INTERVAL_SECONDS = 300.0
 KEEPALIVE_TIMEOUT_SECONDS = 25.0
 KEEPALIVE_TRANSIENT_RETRIES = 2
+PURCHASES_COMMAND_DEFAULT_COUNT = 5
+PURCHASES_COMMAND_MAX_COUNT = 10
 _SESSION_EXPIRED_MESSAGE = "세션이 만료되었습니다. /login으로 다시 로그인해주세요."
 _GAMES_TYPE_LABEL_BY_OPTION = {
     "victory": "승부식",
@@ -147,6 +149,10 @@ def _to_float(value: object, default: float = 0.0) -> float:
         return float(str(value).replace(",", "").strip())
     except Exception:
         return default
+
+
+def _normalize_purchases_count(value: object) -> int:
+    return max(1, min(PURCHASES_COMMAND_MAX_COUNT, _to_int(value, PURCHASES_COMMAND_DEFAULT_COUNT)))
 
 
 def _build_fake_match(item: object, index: int) -> MatchBet:
@@ -296,12 +302,18 @@ def _select_new_purchase_slips(
     return new_slips, current_set, False
 
 
-async def _track_user_for_auto_notify(state: AutoNotifyState, discord_user_id: str) -> None:
+async def _track_user_for_auto_notify(
+    state: AutoNotifyState,
+    discord_user_id: str,
+    *,
+    reset_baseline: bool = True,
+) -> None:
     user_id = str(discord_user_id)
     async with state.lock:
         state.watch_user_ids.add(user_id)
-        # Reset baseline so the next cycle sets current purchases as reference.
-        state.seen_slip_ids_by_user.pop(user_id, None)
+        if reset_baseline:
+            # Reset baseline so the next cycle sets current purchases as reference.
+            state.seen_slip_ids_by_user.pop(user_id, None)
         state.session_expired_notified_user_ids.discard(user_id)
 
 
@@ -311,6 +323,22 @@ async def _untrack_user_for_auto_notify(state: AutoNotifyState, discord_user_id:
         state.watch_user_ids.discard(user_id)
         state.seen_slip_ids_by_user.pop(user_id, None)
         state.session_expired_notified_user_ids.discard(user_id)
+
+
+async def _select_and_commit_new_purchase_slips_for_user(
+    state: AutoNotifyState,
+    discord_user_id: str,
+    slips: list[BetSlip],
+) -> tuple[list[BetSlip], bool]:
+    user_id = str(discord_user_id)
+    async with state.lock:
+        if user_id not in state.watch_user_ids:
+            return [], True
+        seen_slip_ids = state.seen_slip_ids_by_user.get(user_id)
+        new_slips, next_seen, baseline_only = _select_new_purchase_slips(slips, seen_slip_ids)
+        state.seen_slip_ids_by_user[user_id] = next_seen
+        state.session_expired_notified_user_ids.discard(user_id)
+    return new_slips, baseline_only
 
 
 async def _run_auto_notify_cycle(
@@ -331,7 +359,6 @@ async def _run_auto_notify_cycle(
                 async with state.lock:
                     was_watching = discord_user_id in state.watch_user_ids
                     state.watch_user_ids.discard(discord_user_id)
-                    state.seen_slip_ids_by_user.pop(discord_user_id, None)
                     if was_watching and discord_user_id not in state.session_expired_notified_user_ids:
                         state.session_expired_notified_user_ids.add(discord_user_id)
                         should_notify = True
@@ -348,18 +375,11 @@ async def _run_auto_notify_cycle(
             logger.warning("Auto notify purchase fetch failed: discord_user_id=%s error=%s", discord_user_id, exc)
             continue
 
-        async with state.lock:
-            if discord_user_id not in state.watch_user_ids:
-                continue
-            seen_slip_ids = state.seen_slip_ids_by_user.get(discord_user_id)
-
-        new_slips, next_seen, baseline_only = _select_new_purchase_slips(slips, seen_slip_ids)
-
-        async with state.lock:
-            if discord_user_id not in state.watch_user_ids:
-                continue
-            state.seen_slip_ids_by_user[discord_user_id] = next_seen
-            state.session_expired_notified_user_ids.discard(discord_user_id)
+        new_slips, baseline_only = await _select_and_commit_new_purchase_slips_for_user(
+            state,
+            discord_user_id,
+            slips,
+        )
 
         if baseline_only or not new_slips:
             continue
@@ -1070,6 +1090,15 @@ async def main() -> None:
         await _start_keepalive_if_needed(session, discord_user_id)
         return session
 
+    async def send_new_purchases_to_notify_channel(discord_user_id: str, slips: list[BetSlip]) -> None:
+        if notify_channel_id is None:
+            return
+        channel = await _resolve_notify_channel(bot, notify_channel_id)
+        if channel is None:
+            return
+        embeds = _build_compact_purchase_embeds(slips, mode_label="신규 구매")
+        await channel.send(content=_build_auto_notify_content(discord_user_id, len(slips)), embeds=embeds)
+
     async def do_login(discord_user_id: str, user_id: str, user_pw: str) -> bool:
         session = await get_user_session(discord_user_id)
         start_keepalive = False
@@ -1111,7 +1140,32 @@ async def main() -> None:
         if start_keepalive:
             await _start_keepalive_if_needed(session, discord_user_id)
         if login_ok:
-            await _track_user_for_auto_notify(auto_notify_state, discord_user_id)
+            await _track_user_for_auto_notify(auto_notify_state, discord_user_id, reset_baseline=False)
+            try:
+                slips = await _fetch_recent_purchases_all(discord_user_id)
+                new_slips, baseline_only = await _select_and_commit_new_purchase_slips_for_user(
+                    auto_notify_state,
+                    discord_user_id,
+                    slips,
+                )
+                if not baseline_only and new_slips:
+                    try:
+                        await send_new_purchases_to_notify_channel(discord_user_id, new_slips)
+                    except Exception as send_exc:
+                        logger.warning(
+                            "Login reconcile send failed: discord_user_id=%s count=%d error=%s",
+                            discord_user_id,
+                            len(new_slips),
+                            send_exc,
+                        )
+                    else:
+                        logger.info(
+                            "Login reconcile sent new purchases: discord_user_id=%s count=%d",
+                            discord_user_id,
+                            len(new_slips),
+                        )
+            except Exception as exc:
+                logger.warning("Login reconcile fetch failed: discord_user_id=%s error=%s", discord_user_id, exc)
         return login_ok
 
     async def _fetch_recent_purchases_all(discord_user_id: str) -> list[BetSlip]:
@@ -1150,9 +1204,38 @@ async def main() -> None:
         finally:
             await _end_user_request(session)
 
-    async def do_purchases(discord_user_id: str) -> list[BetSlip]:
+    async def do_purchases(discord_user_id: str, count: int) -> list[BetSlip]:
         slips = await _fetch_recent_purchases_all(discord_user_id)
-        return slips[:5]
+        return slips[: _normalize_purchases_count(count)]
+
+    async def do_purchases_snapshot(discord_user_id: str, target_slip_ids: list[str]) -> dict[str, object] | None:
+        if not target_slip_ids:
+            return {
+                "files": [],
+                "attempted_count": 0,
+                "success_count": 0,
+                "failed_count": 0,
+                "exact_success_count": 0,
+                "fallback_success_count": 0,
+            }
+        session = await get_user_session(discord_user_id)
+        await _begin_user_request(session)
+        try:
+            await _ensure_logged_in(session)
+            page = await session.context.new_page()
+            try:
+                return await capture_purchase_paper_area_snapshots(
+                    page,
+                    target_slip_ids,
+                    discord_user_id=discord_user_id,
+                )
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        finally:
+            await _end_user_request(session)
 
     async def do_analysis(discord_user_id: str, months: int) -> PurchaseAnalysis:
         session = await get_user_session(discord_user_id)
@@ -1308,6 +1391,7 @@ async def main() -> None:
 
     bot.login_callback = do_login
     bot.purchase_callback = do_purchases
+    bot.purchase_snapshot_callback = do_purchases_snapshot
     bot.analysis_callback = do_analysis
     bot.games_callback = do_games
     bot.logout_callback = do_logout

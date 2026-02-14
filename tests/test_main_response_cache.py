@@ -8,9 +8,12 @@ import pytest
 
 from src.main import (
     AnalysisCacheEntry,
+    PURCHASES_COMMAND_DEFAULT_COUNT,
+    PURCHASES_COMMAND_MAX_COUNT,
     PurchasesCacheEntry,
     UserSession,
     _filter_sale_games_snapshot,
+    _normalize_purchases_count,
     _resolve_analysis_with_cache,
     _resolve_purchases_with_cache,
 )
@@ -354,3 +357,16 @@ def test_filter_sale_games_snapshot_invalid_sport_defaults_to_all() -> None:
     filtered = _filter_sale_games_snapshot(snapshot, "victory", "unknown-sport")
     assert filtered.total_matches == 2
     assert filtered.total_games == 1
+
+
+def test_normalize_purchases_count_clamps_to_range() -> None:
+    assert _normalize_purchases_count(-10) == 1
+    assert _normalize_purchases_count(0) == 1
+    assert _normalize_purchases_count(1) == 1
+    assert _normalize_purchases_count(7) == 7
+    assert _normalize_purchases_count(10) == PURCHASES_COMMAND_MAX_COUNT
+    assert _normalize_purchases_count(999) == PURCHASES_COMMAND_MAX_COUNT
+
+
+def test_normalize_purchases_count_uses_default_for_invalid_value() -> None:
+    assert _normalize_purchases_count("abc") == PURCHASES_COMMAND_DEFAULT_COUNT

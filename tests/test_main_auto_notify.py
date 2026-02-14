@@ -13,6 +13,7 @@ from src.main import (
     _parse_polling_interval_minutes,
     _restore_watch_user_ids_from_session_files,
     _run_auto_notify_cycle,
+    _select_and_commit_new_purchase_slips_for_user,
     _track_user_for_auto_notify,
     _untrack_user_for_auto_notify,
 )
@@ -90,9 +91,9 @@ async def test_track_and_untrack_user_for_auto_notify() -> None:
 
     state.seen_slip_ids_by_user["111"] = {"A"}
     state.session_expired_notified_user_ids.add("111")
-    await _track_user_for_auto_notify(state, "111")
+    await _track_user_for_auto_notify(state, "111", reset_baseline=False)
     assert "111" in state.watch_user_ids
-    assert "111" not in state.seen_slip_ids_by_user
+    assert state.seen_slip_ids_by_user["111"] == {"A"}
     assert "111" not in state.session_expired_notified_user_ids
 
     await _untrack_user_for_auto_notify(state, "111")
@@ -125,7 +126,36 @@ async def test_auto_notify_session_expired_untracks_and_sends_notice() -> None:
     send_new.assert_not_awaited()
     send_expired.assert_awaited_once_with("111")
     assert "111" not in state.watch_user_ids
-    assert "111" not in state.seen_slip_ids_by_user
+    assert state.seen_slip_ids_by_user["111"] == {"A"}
+
+
+async def test_select_and_commit_new_purchase_slips_for_user_tracks_seen_and_returns_new() -> None:
+    state = AutoNotifyState(
+        watch_user_ids={"111"},
+        seen_slip_ids_by_user={"111": {"A"}},
+    )
+    slips = [_slip("C", "2026.02.13 12:00"), _slip("B", "2026.02.13 11:00"), _slip("A", "2026.02.13 10:00")]
+
+    new_slips, baseline_only = await _select_and_commit_new_purchase_slips_for_user(state, "111", slips)
+
+    assert baseline_only is False
+    assert [s.slip_id for s in new_slips] == ["B", "C"]
+    assert state.seen_slip_ids_by_user["111"] == {"A", "B", "C"}
+
+
+async def test_relogin_uses_previous_seen_baseline_and_detects_new_slips() -> None:
+    state = AutoNotifyState(
+        watch_user_ids=set(),
+        seen_slip_ids_by_user={"111": {"A"}},
+    )
+
+    await _track_user_for_auto_notify(state, "111", reset_baseline=False)
+    slips = [_slip("C", "2026.02.13 12:00"), _slip("B", "2026.02.13 11:00"), _slip("A", "2026.02.13 10:00")]
+    new_slips, baseline_only = await _select_and_commit_new_purchase_slips_for_user(state, "111", slips)
+
+    assert baseline_only is False
+    assert [s.slip_id for s in new_slips] == ["B", "C"]
+    assert state.seen_slip_ids_by_user["111"] == {"A", "B", "C"}
 
 
 def test_auto_notify_message_has_no_mention() -> None:
