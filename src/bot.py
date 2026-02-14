@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -51,6 +52,11 @@ _SPORT_LABEL_BY_VALUE = {
     "basketball": "농구",
     "volleyball": "배구",
 }
+_PURCHASE_GAME_TYPE_ORDER = ("승부식", "승무패", "기록식", "기타")
+_HOME_SELECTION_TOKENS = {"1", "승", "홈승", "home", "h"}
+_AWAY_SELECTION_TOKENS = {"2", "패", "원정승", "away", "a"}
+_DRAW_SELECTION_TOKENS = {"x", "무", "무승부", "draw", "d"}
+_MAX_FILES_PER_MESSAGE = 10
 
 
 def _load_login_id_map(path: Path = LOGIN_ID_MAP_PATH) -> dict[str, str]:
@@ -164,10 +170,55 @@ def _actual_result_text(match: MatchBet) -> str:
     return " | ".join(parts)
 
 
+def _normalize_purchase_game_type_label(value: str | None) -> str:
+    text = str(value or "").strip()
+    compact = re.sub(r"\s+", "", text)
+    if "승부식" in compact:
+        return "승부식"
+    if "승무패" in compact:
+        return "승무패"
+    if "기록식" in compact:
+        return "기록식"
+    return "기타"
+
+
+def _group_purchase_slips_by_game_type(slips: list[BetSlip]) -> list[tuple[str, list[BetSlip]]]:
+    grouped: dict[str, list[BetSlip]] = {label: [] for label in _PURCHASE_GAME_TYPE_ORDER}
+    for slip in slips:
+        grouped[_normalize_purchase_game_type_label(slip.game_type)].append(slip)
+    return [(label, grouped[label]) for label in _PURCHASE_GAME_TYPE_ORDER if grouped[label]]
+
+
+def _normalize_bet_selection_side(value: str | None) -> str:
+    compact = re.sub(r"\s+", "", str(value or "").strip()).lower()
+    if not compact:
+        return "unknown"
+    if compact in _HOME_SELECTION_TOKENS:
+        return "home"
+    if compact in _AWAY_SELECTION_TOKENS:
+        return "away"
+    if compact in _DRAW_SELECTION_TOKENS:
+        return "draw"
+    return "unknown"
+
+
+def _format_match_teams_with_pick_highlight(match: MatchBet) -> str:
+    home_team = (match.home_team or "").strip() or "홈팀 미상"
+    away_team = (match.away_team or "").strip() or "원정팀 미상"
+    selection_side = _normalize_bet_selection_side(match.bet_selection)
+    if selection_side == "home":
+        return f"🎯 **{home_team}** vs {away_team}"
+    if selection_side == "away":
+        return f"{home_team} vs 🎯 **{away_team}**"
+    if selection_side == "draw":
+        return f"{home_team} vs {away_team} (🎯 **무승부 픽**)"
+    return f"{home_team} vs {away_team}"
+
+
 def _format_match_line(match: MatchBet, index: int) -> str:
     odds_text = f"({match.odds:.2f})" if match.odds else ""
     line = (
-        f"{index}. {match.home_team} vs {match.away_team} | "
+        f"{index}. {_format_match_teams_with_pick_highlight(match)} | "
         f"선택 {match.bet_selection or '-'}{odds_text} | "
         f"실제 {_actual_result_text(match)}"
     )
@@ -193,6 +244,10 @@ def _build_summary_embed(slips: list[BetSlip], mode_label: str) -> discord.Embed
     embed.add_field(name="총 구매금액", value=_format_won(total_purchase), inline=True)
     embed.add_field(name="총 실제적중금", value=_format_won(total_actual), inline=True)
     embed.add_field(name="총 손익", value=_format_won(total_actual - total_purchase), inline=True)
+    game_type_groups = _group_purchase_slips_by_game_type(slips)
+    if game_type_groups:
+        game_type_lines = [f"{label}: {len(group_slips)}건" for label, group_slips in game_type_groups]
+        embed.add_field(name="게임유형별 건수", value="\n".join(game_type_lines)[:1024], inline=False)
     return embed
 
 
@@ -314,7 +369,7 @@ def _build_slip_embed(index: int, slip: BetSlip) -> discord.Embed:
         field_name = f"{match.match_number}. {league}" if league else f"{match.match_number}. 경기"
 
         lines = [
-            f"{match.home_team} vs {match.away_team}",
+            _format_match_teams_with_pick_highlight(match),
             f"내 선택: {match.bet_selection or '-'} ({match.odds:.2f})" if match.odds else f"내 선택: {match.bet_selection or '-'}",
             f"실제 결과: {_actual_result_text(match)}",
         ]
@@ -338,24 +393,30 @@ def _build_slip_embed(index: int, slip: BetSlip) -> discord.Embed:
 def _build_compact_purchase_embeds(slips: list[BetSlip], mode_label: str = "최근 5개") -> list[discord.Embed]:
     summary = _build_summary_embed(slips, mode_label)
     lines: list[str] = []
+    display_index = 1
 
-    for idx, slip in enumerate(slips, start=1):
-        status = _status_text(slip)
-        odds_text = f"{slip.combined_odds:.2f}" if slip.combined_odds else "-"
-        lines.append(
-            f"[{idx}] {_slip_icon(slip)} `{slip.slip_id}` · {status}"
-        )
-        lines.append(
-            f"구매시각 {slip.purchase_datetime or '-'} · 구매 {_format_won(slip.total_amount)} · 배당 {odds_text}"
-        )
+    for game_type_label, grouped_slips in _group_purchase_slips_by_game_type(slips):
+        lines.append(f"=== {game_type_label} ===")
+        for slip in grouped_slips:
+            status = _status_text(slip)
+            odds_text = f"{slip.combined_odds:.2f}" if slip.combined_odds else "-"
+            lines.append(
+                f"[{display_index}] {_slip_icon(slip)} `{slip.slip_id}` · {status}"
+            )
+            lines.append(
+                f"구매시각 {slip.purchase_datetime or '-'} · 구매 {_format_won(slip.total_amount)} · 배당 {odds_text}"
+            )
 
-        if not slip.matches:
-            lines.append("  - 상세 경기 정보를 찾지 못했습니다.")
+            if not slip.matches:
+                lines.append("  - 상세 경기 정보를 찾지 못했습니다.")
+                lines.append("")
+                display_index += 1
+                continue
+
+            for match_idx, match in enumerate(slip.matches, start=1):
+                lines.append(_format_match_line(match, match_idx))
             lines.append("")
-            continue
-
-        for match_idx, match in enumerate(slip.matches, start=1):
-            lines.append(_format_match_line(match, match_idx))
+            display_index += 1
         lines.append("")
 
     chunks: list[str] = []
@@ -393,13 +454,19 @@ def _build_compact_purchase_embeds(slips: list[BetSlip], mode_label: str = "최�
     return [summary] + detail_embeds
 
 
+def _split_files_for_followup(files: list[discord.File], chunk_size: int = _MAX_FILES_PER_MESSAGE) -> list[list[discord.File]]:
+    safe_size = max(1, int(chunk_size))
+    return [files[idx : idx + safe_size] for idx in range(0, len(files), safe_size)]
+
+
 class Bot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.login_callback: Callable[[str, str, str], Awaitable[bool]] | None = None
-        self.purchase_callback: Callable[[str], Awaitable[list[BetSlip]]] | None = None
+        self.purchase_callback: Callable[[str, int], Awaitable[list[BetSlip]]] | None = None
+        self.purchase_snapshot_callback: Callable[[str, list[str]], Awaitable[dict[str, object] | None]] | None = None
         self.analysis_callback: Callable[[str, int], Awaitable[PurchaseAnalysis]] | None = None
         self.games_callback: Callable[[str, str], Awaitable[SaleGamesSnapshot]] | None = None
         self.logout_callback: Callable[[str], Awaitable[bool]] | None = None
@@ -438,25 +505,96 @@ class Bot(discord.Client):
             )
 
         @self.tree.command(name="purchases", description="구매내역 조회")
-        async def purchases_command(interaction: discord.Interaction) -> None:
+        @app_commands.describe(count="최근 조회 건수 (1~10, 기본 5)")
+        async def purchases_command(
+            interaction: discord.Interaction,
+            count: app_commands.Range[int, 1, 10] = 5,
+        ) -> None:
             if self.purchase_callback is None:
                 await interaction.response.send_message("구매내역 기능이 준비되지 않았습니다.", ephemeral=True)
                 return
 
             await interaction.response.defer(thinking=True)
             try:
-                slips = await self.purchase_callback(str(interaction.user.id))
+                slips = await self.purchase_callback(str(interaction.user.id), int(count))
             except Exception as exc:
                 logger.exception("Failed to scrape purchases")
                 await interaction.followup.send(f"구매내역 조회 실패: {exc}")
                 return
 
             if not slips:
-                await interaction.followup.send("조회된 구매내역이 없습니다.")
+                await interaction.followup.send("투표지 스크린샷을 첨부할 대상이 없습니다.")
                 return
 
-            embeds = _build_compact_purchase_embeds(slips)
-            await interaction.followup.send(embeds=embeds)
+            sale_open_count = sum(1 for slip in slips if str(slip.status or "").strip() == "발매중")
+            sale_close_count = sum(1 for slip in slips if str(slip.status or "").strip() == "발매마감")
+            hit_count = sum(1 for slip in slips if str(slip.status or "").strip() == "적중" or (slip.result or "").strip() == "적중")
+            miss_count = sum(
+                1
+                for slip in slips
+                if str(slip.status or "").strip() in {"적중안됨", "미적중"} or (slip.result or "").strip() == "미적중"
+            )
+            files: list[discord.File] = []
+            target_slip_ids: list[str] = []
+            seen_target_ids: set[str] = set()
+            for slip in slips:
+                if str(slip.status or "").strip() not in {"발매중", "발매마감"}:
+                    continue
+                slip_id = str(slip.slip_id).strip()
+                if not slip_id or slip_id in seen_target_ids:
+                    continue
+                seen_target_ids.add(slip_id)
+                target_slip_ids.append(slip_id)
+
+            attempted_snapshot_count = len(target_slip_ids)
+            success_count = 0
+            failed_count = 0
+            exact_success_count = 0
+            fallback_success_count = 0
+            if self.purchase_snapshot_callback is not None:
+                discord_user_id = str(interaction.user.id)
+                try:
+                    if target_slip_ids:
+                        snapshot_result = await self.purchase_snapshot_callback(discord_user_id, target_slip_ids)
+                        result_map = snapshot_result or {}
+                        if isinstance(result_map, dict):
+                            attempted_snapshot_count = int(result_map.get("attempted_count", attempted_snapshot_count) or attempted_snapshot_count)
+                            success_count = int(result_map.get("success_count", 0) or 0)
+                            failed_count = int(result_map.get("failed_count", 0) or 0)
+                            exact_success_count = int(result_map.get("exact_success_count", 0) or 0)
+                            fallback_success_count = int(result_map.get("fallback_success_count", 0) or 0)
+                            snapshot_files = result_map.get("files") or []
+                        else:
+                            snapshot_files = result_map
+                        for filename, data in snapshot_files or []:
+                            if not data:
+                                continue
+                            safe_name = str(filename or "").strip() or f"paper_{discord_user_id}.png"
+                            files.append(discord.File(io.BytesIO(data), filename=safe_name))
+                        if success_count <= 0:
+                            success_count = len(files)
+                        if failed_count <= 0:
+                            failed_count = max(0, attempted_snapshot_count - success_count)
+                except Exception as exc:
+                    logger.warning("Failed to capture purchase snapshot: discord_user_id=%s error=%s", discord_user_id, exc)
+
+            summary_line = (
+                f"[구매 요약] 조회 {len(slips)}건 · 발매중 {sale_open_count} · 발매마감 {sale_close_count} · "
+                f"적중/미적중 {hit_count}/{miss_count} · 첨부 {len(files)}건"
+            )
+
+            if files:
+                chunks = _split_files_for_followup(files, _MAX_FILES_PER_MESSAGE)
+                try:
+                    first_kwargs: dict[str, object] = {"content": summary_line, "files": chunks[0]}
+                    await interaction.followup.send(**first_kwargs)
+                    for chunk in chunks[1:]:
+                        await interaction.followup.send(files=chunk)
+                except Exception as exc:
+                    logger.warning("Failed to send purchase snapshots as files: error=%s", exc)
+                    await interaction.followup.send(content=summary_line)
+            else:
+                await interaction.followup.send(content=summary_line)
 
         @self.tree.command(name="analysis", description="구매현황분석 조회")
         @app_commands.describe(months="조회 개월 수 (1~12, 기본 12)")
