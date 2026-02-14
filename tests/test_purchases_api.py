@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from src.models import BetSlip
 from src.purchases import (
     _build_recent_purchases_token_from_items,
     _extract_purchase_items,
@@ -14,6 +16,7 @@ from src.purchases import (
     _status_result_from_buy_status_info,
     _status_result_from_list_item,
     capture_purchase_paper_area_snapshots,
+    scrape_purchase_history,
 )
 
 
@@ -790,3 +793,81 @@ async def test_capture_purchase_paper_area_snapshots_without_max_count_captures_
 
     assert len(result["files"]) == len(slip_ids)
     assert [name for name, _ in result["files"]] == [f"paper_S-{i}.png" for i in range(1, 7)]
+
+
+async def test_capture_purchase_paper_area_snapshots_does_not_wait_network_timeout_when_dom_ready(monkeypatch) -> None:
+    async def _noop_navigate(_page: _FakePaperPage) -> None:
+        return None
+
+    monkeypatch.setattr("src.purchases.navigate_to_purchase_history", _noop_navigate)
+    page = _FakePaperPage(["S-1"])
+    page.response_timeout_for.add("S-1")
+
+    started = time.monotonic()
+    result = await capture_purchase_paper_area_snapshots(page, ["S-1"], max_count=5)  # type: ignore[arg-type]
+    elapsed_ms = (time.monotonic() - started) * 1000
+
+    assert result["files"] == [("paper_S-1.png", b"img-S-1")]
+    assert elapsed_ms < 80
+
+
+async def test_scrape_purchase_history_skips_detail_fetch_when_include_match_details_false(monkeypatch) -> None:
+    async def _noop_navigate(_page: object) -> None:
+        return None
+
+    sample_slip = BetSlip(
+        slip_id="S-1",
+        game_type="프로토 승부식",
+        round_number="1회차",
+        status="발매중",
+        purchase_datetime="2026.02.14 10:00",
+        total_amount=5000,
+        potential_payout=0,
+        combined_odds=0.0,
+        matches=[],
+    )
+
+    async def _fake_collect(_page: object, _limit: int) -> tuple[list[BetSlip], dict[str, dict[str, str]], dict[str, object]]:
+        return [sample_slip], {"S-1": {"btkNum": "S-1"}}, {"pages": 1, "api_ok": True}
+
+    detail_fetch = AsyncMock(return_value=(1, 0))
+    monkeypatch.setattr("src.purchases.navigate_to_purchase_history", _noop_navigate)
+    monkeypatch.setattr("src.purchases._collect_slips_via_list_api", _fake_collect)
+    monkeypatch.setattr("src.purchases._fetch_match_details_for_slips", detail_fetch)
+
+    slips = await scrape_purchase_history(object(), limit=5, include_match_details=False)  # type: ignore[arg-type]
+
+    assert len(slips) == 1
+    assert slips[0].slip_id == "S-1"
+    detail_fetch.assert_not_awaited()
+
+
+async def test_scrape_purchase_history_fetches_detail_when_include_match_details_true(monkeypatch) -> None:
+    async def _noop_navigate(_page: object) -> None:
+        return None
+
+    sample_slip = BetSlip(
+        slip_id="S-1",
+        game_type="프로토 승부식",
+        round_number="1회차",
+        status="발매중",
+        purchase_datetime="2026.02.14 10:00",
+        total_amount=5000,
+        potential_payout=0,
+        combined_odds=0.0,
+        matches=[],
+    )
+
+    async def _fake_collect(_page: object, _limit: int) -> tuple[list[BetSlip], dict[str, dict[str, str]], dict[str, object]]:
+        return [sample_slip], {"S-1": {"btkNum": "S-1"}}, {"pages": 1, "api_ok": True}
+
+    detail_fetch = AsyncMock(return_value=(1, 0))
+    monkeypatch.setattr("src.purchases.navigate_to_purchase_history", _noop_navigate)
+    monkeypatch.setattr("src.purchases._collect_slips_via_list_api", _fake_collect)
+    monkeypatch.setattr("src.purchases._fetch_match_details_for_slips", detail_fetch)
+
+    slips = await scrape_purchase_history(object(), limit=5, include_match_details=True)  # type: ignore[arg-type]
+
+    assert len(slips) == 1
+    assert slips[0].slip_id == "S-1"
+    detail_fetch.assert_awaited_once()

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 from discord import app_commands
 
 from src.bot import Bot
-from src.models import BetSlip, PurchaseAnalysis, SaleGamesSnapshot
+from src.models import BetSlip, GamesCaptureResult, PurchaseAnalysis
 
 
 def _make_interaction(user_id: int = 111) -> SimpleNamespace:
@@ -250,13 +250,13 @@ async def test_games_command_sends_public_message() -> None:
     bot = Bot()
     bot._sync_application_commands = AsyncMock()  # type: ignore[method-assign]
     bot.games_callback = AsyncMock(
-        return_value=SaleGamesSnapshot(
+        return_value=GamesCaptureResult(
             fetched_at="2026.02.13 19:00:00",
-            total_games=1,
-            total_matches=2,
-            sport_counts={"축구": 2},
-            nearest_matches=[],
-            partial_failures=0,
+            game_type="all",
+            sport="all",
+            files=[("games_all_all_01.jpg", b"jpeg-1")],
+            captured_count=1,
+            truncated=False,
         )
     )
 
@@ -270,20 +270,36 @@ async def test_games_command_sends_public_message() -> None:
     bot.games_callback.assert_awaited_once_with("victory", "all")
     interaction.response.defer.assert_awaited_once_with(thinking=True)
     kwargs = interaction.followup.send.await_args.kwargs
+    assert "files" in kwargs
+    assert len(kwargs["files"]) == 1
+    assert kwargs["files"][0].filename == "games_all_all_01.jpg"
+    assert "content" not in kwargs
     assert "ephemeral" not in kwargs
+
+
+async def test_games_command_game_type_choices_excludes_all() -> None:
+    bot = Bot()
+    bot._sync_application_commands = AsyncMock()  # type: ignore[method-assign]
+
+    await bot.setup_hook()
+    command = bot.tree.get_command("games")
+    assert command is not None
+
+    game_type_param = next(param for param in command.parameters if param.name == "game_type")
+    assert [choice.value for choice in game_type_param.choices] == ["victory", "windrawlose", "record"]
 
 
 async def test_games_command_passes_selected_game_type() -> None:
     bot = Bot()
     bot._sync_application_commands = AsyncMock()  # type: ignore[method-assign]
     bot.games_callback = AsyncMock(
-        return_value=SaleGamesSnapshot(
+        return_value=GamesCaptureResult(
             fetched_at="2026.02.13 19:00:00",
-            total_games=1,
-            total_matches=1,
-            sport_counts={"축구": 1},
-            nearest_matches=[],
-            partial_failures=0,
+            game_type="record",
+            sport="basketball",
+            files=[("games_record_basketball_01.jpg", b"jpeg-1")],
+            captured_count=1,
+            truncated=False,
         )
     )
 
@@ -305,13 +321,13 @@ async def test_games_command_empty_message_includes_selected_type() -> None:
     bot = Bot()
     bot._sync_application_commands = AsyncMock()  # type: ignore[method-assign]
     bot.games_callback = AsyncMock(
-        return_value=SaleGamesSnapshot(
+        return_value=GamesCaptureResult(
             fetched_at="2026.02.13 19:00:00",
-            total_games=0,
-            total_matches=0,
-            sport_counts={},
-            nearest_matches=[],
-            partial_failures=0,
+            game_type="all",
+            sport="all",
+            files=[],
+            captured_count=0,
+            truncated=False,
         )
     )
 
@@ -325,5 +341,60 @@ async def test_games_command_empty_message_includes_selected_type() -> None:
     kwargs = interaction.followup.send.await_args.kwargs
     assert kwargs == {}
     args = interaction.followup.send.await_args.args
-    assert args
-    assert "조회 타입(승부식), 종목(전체)" in args[0]
+    assert args == ("경기 스크린샷을 첨부할 수 없습니다.",)
+
+
+async def test_games_command_runs_without_login_callback() -> None:
+    bot = Bot()
+    bot._sync_application_commands = AsyncMock()  # type: ignore[method-assign]
+    bot.games_callback = AsyncMock(
+        return_value=GamesCaptureResult(
+            fetched_at="2026.02.13 19:00:00",
+            game_type="victory",
+            sport="all",
+            files=[("games_victory_all_proto_01.jpg", b"jpeg-1")],
+            captured_count=1,
+            truncated=False,
+        )
+    )
+
+    await bot.setup_hook()
+    command = bot.tree.get_command("games")
+    assert command is not None
+
+    interaction = _make_interaction(2222)
+    await command.callback(interaction)
+
+    bot.games_callback.assert_awaited_once_with("victory", "all")
+    interaction.followup.send.assert_awaited()
+
+
+async def test_games_command_splits_files_when_over_limit() -> None:
+    bot = Bot()
+    bot._sync_application_commands = AsyncMock()  # type: ignore[method-assign]
+    files = [(f"games_all_all_{idx:02d}.jpg", f"jpeg-{idx}".encode("utf-8")) for idx in range(1, 13)]
+    bot.games_callback = AsyncMock(
+        return_value=GamesCaptureResult(
+            fetched_at="2026.02.13 19:00:00",
+            game_type="all",
+            sport="all",
+            files=files,
+            captured_count=len(files),
+            truncated=False,
+        )
+    )
+
+    await bot.setup_hook()
+    command = bot.tree.get_command("games")
+    assert command is not None
+
+    interaction = _make_interaction(999)
+    await command.callback(interaction)
+
+    assert interaction.followup.send.await_count == 2
+    first_kwargs = interaction.followup.send.await_args_list[0].kwargs
+    second_kwargs = interaction.followup.send.await_args_list[1].kwargs
+    assert len(first_kwargs["files"]) == 10
+    assert len(second_kwargs["files"]) == 2
+    assert "content" not in first_kwargs
+    assert "content" not in second_kwargs
