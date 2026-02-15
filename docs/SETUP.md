@@ -10,8 +10,6 @@
 https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&permissions=2048&scope=bot+applications.commands
 ```
 
-4. 알림 채널 ID를 복사해 `.env`의 `DISCORD_CHANNEL_ID`에 설정
-
 ## 2. 환경 변수 설정
 
 ```bash
@@ -22,10 +20,8 @@ cp .env.example .env
 
 ```env
 DISCORD_BOT_TOKEN=your_bot_token_here
-DISCORD_CHANNEL_ID=123456789012345678
 DISCORD_GUILD_ID=
 HEADLESS=true
-POLLING_INTERVAL_MINUTES=5
 FAKE_PURCHASES_FILE=/app/storage/fake_purchases.json
 ```
 
@@ -51,23 +47,7 @@ docker-compose logs -f
 
 1. `/login` 으로 Betman 로그인
 2. 필요 시 `/purchases`, `/analysis`, `/games` 수동 조회
-3. 이후에는 신규 구매가 생기면 `DISCORD_CHANNEL_ID` 채널에 자동 알림
-4. `/logout` 시 해당 사용자 자동 감시 중단
-
-## 5. 자동 알림 동작
-
-상세 동작/예외는 `docs/AUTO_NOTIFY.md`를 참고하세요.
-
-- 주기: `POLLING_INTERVAL_MINUTES` (1~60, 기본 5)
-- 기준: 신규 `slip_id`만 알림
-- 감시 대상:
-  - `/login` 성공 사용자
-  - 재시작 시 `storage/session_state_*.json` 복원 사용자
-- 시작 시 baseline 설정:
-  - 기존 구매내역은 알리지 않고 기준선으로만 저장
-- 세션 만료:
-  - 해당 사용자 감시 해제
-  - 채널에 재로그인 안내 메시지 전송
+3. `/logout` 으로 세션/자동 로그인 자격증명을 함께 정리
 
 ### 실구매 없이 테스트하기
 
@@ -101,7 +81,7 @@ docker-compose logs -f
 ]
 ```
 
-## 6. 트러블슈팅
+## 5. 트러블슈팅
 
 ### 슬래시 명령이 안 보일 때
 

@@ -74,7 +74,6 @@ cp .env.example .env
 
 `.env` 설정:
 - `DISCORD_BOT_TOKEN`
-- `DISCORD_CHANNEL_ID`
 - `DISCORD_GUILD_ID` (즉시 명령 동기화 권장)
 - 필요 시 `HEADLESS=true`
 
