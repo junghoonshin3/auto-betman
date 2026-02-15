@@ -40,7 +40,7 @@ _MARK_LABELS = {
     "3": "패",
 }
 
-_PAPER_STABLE_TIMEOUT_MS = 5000
+_PAPER_STABLE_TIMEOUT_MS = 3000
 _PAPER_STABLE_ROUNDS = 2
 _PAPER_STABLE_SAMPLE_INTERVAL_MS = 350
 _GAME_DETAIL_ENDPOINT_TOKEN = "/mypgPurWin/getGameDetail.do"
@@ -990,6 +990,58 @@ def _create_game_detail_response_task(page: Page) -> asyncio.Task[Response] | No
         return None
 
 
+async def _consume_game_detail_response_task(
+    response_task: asyncio.Task[Response] | None,
+    *,
+    request_id: str,
+    discord_user_id: str,
+    target_slip_id: str,
+    attempt: int,
+) -> str:
+    if response_task is None:
+        return ""
+    if response_task.cancelled():
+        return ""
+
+    if not response_task.done():
+        response_task.cancel()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await response_task
+        return ""
+
+    try:
+        response = response_task.result()
+        network_btk_num = await _extract_btk_num_from_network_response(response)
+        logger.info(
+            "paperArea getGameDetail response request_id=%s discord_user_id=%s slip_id=%s attempt=%d status=%s btkNum=%s",
+            request_id,
+            discord_user_id,
+            target_slip_id,
+            attempt,
+            response.status,
+            network_btk_num or "-",
+        )
+        return network_btk_num
+    except PlaywrightTimeoutError:
+        logger.warning(
+            "paperArea getGameDetail timeout request_id=%s discord_user_id=%s slip_id=%s attempt=%d",
+            request_id,
+            discord_user_id,
+            target_slip_id,
+            attempt,
+        )
+    except Exception as exc:
+        logger.warning(
+            "paperArea getGameDetail wait failed request_id=%s discord_user_id=%s slip_id=%s attempt=%d error=%s",
+            request_id,
+            discord_user_id,
+            target_slip_id,
+            attempt,
+            exc,
+        )
+    return ""
+
+
 async def _wait_for_paper_area_vote_loaded(
     page: Page,
     *,
@@ -1077,37 +1129,6 @@ async def _open_target_paper_with_retry(
                     await response_task
             continue
 
-        if response_task is not None:
-            try:
-                response = await response_task
-                network_btk_num = await _extract_btk_num_from_network_response(response)
-                logger.info(
-                    "paperArea getGameDetail response request_id=%s discord_user_id=%s slip_id=%s attempt=%d status=%s btkNum=%s",
-                    request_id,
-                    discord_user_id,
-                    target_slip_id,
-                    attempt,
-                    response.status,
-                    network_btk_num or "-",
-                )
-            except PlaywrightTimeoutError:
-                logger.warning(
-                    "paperArea getGameDetail timeout request_id=%s discord_user_id=%s slip_id=%s attempt=%d",
-                    request_id,
-                    discord_user_id,
-                    target_slip_id,
-                    attempt,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "paperArea getGameDetail wait failed request_id=%s discord_user_id=%s slip_id=%s attempt=%d error=%s",
-                    request_id,
-                    discord_user_id,
-                    target_slip_id,
-                    attempt,
-                    exc,
-                )
-
         try:
             await page.wait_for_load_state("networkidle", timeout=1500)
         except Exception:
@@ -1122,12 +1143,34 @@ async def _open_target_paper_with_retry(
             _PAPER_STABLE_TIMEOUT_MS,
             _PAPER_STABLE_ROUNDS,
         )
-        ready_state = await _wait_for_paper_area_vote_loaded(
-            page,
-            timeout_ms=_PAPER_STABLE_TIMEOUT_MS,
-            stable_rounds=_PAPER_STABLE_ROUNDS,
-            sample_interval_ms=_PAPER_STABLE_SAMPLE_INTERVAL_MS,
+        dom_ready_task = asyncio.create_task(
+            _wait_for_paper_area_vote_loaded(
+                page,
+                timeout_ms=_PAPER_STABLE_TIMEOUT_MS,
+                stable_rounds=_PAPER_STABLE_ROUNDS,
+                sample_interval_ms=_PAPER_STABLE_SAMPLE_INTERVAL_MS,
+            )
         )
+        wait_tasks: set[asyncio.Task[Any]] = {dom_ready_task}
+        if response_task is not None:
+            wait_tasks.add(response_task)
+        if response_task is not None:
+            done, _pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+            if dom_ready_task not in done:
+                ready_state = await dom_ready_task
+            else:
+                ready_state = dom_ready_task.result()
+            network_btk_num = await _consume_game_detail_response_task(
+                response_task,
+                request_id=request_id,
+                discord_user_id=discord_user_id,
+                target_slip_id=target_slip_id,
+                attempt=attempt,
+            )
+        else:
+            ready_state = await dom_ready_task
+        if response_task is None:
+            network_btk_num = ""
         if ready_state is not None:
             ready_mode = str(ready_state.get("readyMode") or "none").strip() or "none"
             logger.info(
@@ -1325,6 +1368,7 @@ async def capture_purchase_paper_area_snapshots(
     target_slip_ids: list[str],
     max_count: int | None = None,
     discord_user_id: str | None = None,
+    request_id: str | None = None,
 ) -> PurchaseSnapshotResult:
     await navigate_to_purchase_history(page)
 
@@ -1351,10 +1395,11 @@ async def capture_purchase_paper_area_snapshots(
             fallback_success_count=0,
         )
 
-    request_id = _build_capture_request_id(targets)
+    capture_request_id = str(request_id or "").strip() or _build_capture_request_id(targets)
+    started_at = time.monotonic()
     logger.info(
         "paperArea capture start request_id=%s discord_user_id=%s target_count=%d",
-        request_id,
+        capture_request_id,
         user_id_for_log,
         len(targets),
     )
@@ -1362,7 +1407,7 @@ async def capture_purchase_paper_area_snapshots(
     if not row_candidates:
         logger.warning(
             "paperArea capture failed: no openable rows request_id=%s discord_user_id=%s",
-            request_id,
+            capture_request_id,
             user_id_for_log,
         )
         return PurchaseSnapshotResult(
@@ -1386,7 +1431,7 @@ async def capture_purchase_paper_area_snapshots(
             break
         logger.info(
             "paperArea capture target begin request_id=%s discord_user_id=%s slip_id=%s",
-            request_id,
+            capture_request_id,
             user_id_for_log,
             slip_id,
         )
@@ -1395,14 +1440,14 @@ async def capture_purchase_paper_area_snapshots(
         if target_row is None:
             logger.warning(
                 "paperArea capture skipped reason=row_not_found_exact request_id=%s discord_user_id=%s slip_id=%s",
-                request_id,
+                capture_request_id,
                 user_id_for_log,
                 slip_id,
             )
             if fallback_cursor >= len(fallback_queue):
                 logger.warning(
                     "paperArea capture skipped reason=fallback_exhausted request_id=%s discord_user_id=%s slip_id=%s",
-                    request_id,
+                    capture_request_id,
                     user_id_for_log,
                     slip_id,
                 )
@@ -1415,35 +1460,45 @@ async def capture_purchase_paper_area_snapshots(
         if row_idx in used_row_indexes:
             logger.warning(
                 "paperArea capture skipped reason=fallback_exhausted request_id=%s discord_user_id=%s slip_id=%s",
-                request_id,
+                capture_request_id,
                 user_id_for_log,
                 slip_id,
             )
             continue
         logger.info(
             "paperArea row candidate try request_id=%s discord_user_id=%s slip_id=%s row_idx=%d row_slip_id=%s mapping=%s",
-            request_id,
+            capture_request_id,
             user_id_for_log,
             slip_id,
             row_idx,
             row_slip_id or "-",
             mapping_mode,
         )
+        slip_started_at = time.monotonic()
         image = await _capture_target_slip_image(
             page,
             row,
             slip_id,
-            request_id=request_id,
+            request_id=capture_request_id,
             discord_user_id=user_id_for_log,
         )
+        per_slip_ms = (time.monotonic() - slip_started_at) * 1000
         used_row_indexes.add(row_idx)
         if image is None:
             logger.warning(
                 "paperArea capture skipped reason=target_row_failed request_id=%s discord_user_id=%s slip_id=%s row_idx=%d mapping=%s",
-                request_id,
+                capture_request_id,
                 user_id_for_log,
                 slip_id,
                 row_idx,
+                mapping_mode,
+            )
+            logger.info(
+                "paperArea per_slip_ms=%.2f request_id=%s discord_user_id=%s slip_id=%s success=false mapping=%s",
+                per_slip_ms,
+                capture_request_id,
+                user_id_for_log,
+                slip_id,
                 mapping_mode,
             )
             continue
@@ -1456,16 +1511,34 @@ async def capture_purchase_paper_area_snapshots(
             fallback_success_count += 1
         logger.info(
             "paperArea captured request_id=%s discord_user_id=%s slip_id=%s bytes=%d mapping=%s",
-            request_id,
+            capture_request_id,
             user_id_for_log,
             slip_id,
             len(image),
+            mapping_mode,
+        )
+        logger.info(
+            "paperArea per_slip_ms=%.2f request_id=%s discord_user_id=%s slip_id=%s success=true mapping=%s",
+            per_slip_ms,
+            capture_request_id,
+            user_id_for_log,
+            slip_id,
             mapping_mode,
         )
 
     attempted_count = len(targets)
     success_count = len(captured)
     failed_count = max(0, attempted_count - success_count)
+    total_ms = (time.monotonic() - started_at) * 1000
+    logger.info(
+        "paperArea snapshot_total_ms=%.2f request_id=%s discord_user_id=%s attempted=%d success=%d failed=%d",
+        total_ms,
+        capture_request_id,
+        user_id_for_log,
+        attempted_count,
+        success_count,
+        failed_count,
+    )
     return PurchaseSnapshotResult(
         files=captured,
         attempted_count=attempted_count,
@@ -1931,6 +2004,7 @@ async def _fetch_match_details_for_slips(
 async def scrape_purchase_history(
     page: Page,
     limit: int,
+    include_match_details: bool = True,
 ) -> list[BetSlip]:
     limit = max(1, min(limit, 30))
 
@@ -1940,13 +2014,17 @@ async def scrape_purchase_history(
     try:
         slips, detail_params, diagnostics = await _collect_slips_via_list_api(page, limit)
         if slips:
-            success, failed = await _fetch_match_details_for_slips(page, slips, detail_params)
+            success = 0
+            failed = 0
+            if include_match_details:
+                success, failed = await _fetch_match_details_for_slips(page, slips, detail_params)
             logger.info(
-                "purchase scrape api items=%d list_pages=%d detail_success=%d detail_failed=%d",
+                "purchase scrape api items=%d list_pages=%d detail_success=%d detail_failed=%d include_match_details=%s",
                 len(slips),
                 diagnostics.get("pages", 0),
                 success,
                 failed,
+                include_match_details,
             )
             slips.sort(key=lambda s: _parse_dt_for_sort(s.purchase_datetime), reverse=True)
             return slips[:limit]

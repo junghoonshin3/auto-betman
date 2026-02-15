@@ -21,6 +21,7 @@ from src.bot import Bot, _build_compact_purchase_embeds
 from src.games import scrape_sale_games_summary
 from src.models import BetSlip, MatchBet, PurchaseAnalysis, SaleGameMatch, SaleGamesSnapshot
 from src.purchases import capture_purchase_paper_area_snapshots, probe_recent_purchases_token, scrape_purchase_history
+from src.request_context import get_purchase_request_id
 
 logger = logging.getLogger(__name__)
 SESSION_DIR = Path("storage")
@@ -1168,8 +1169,15 @@ async def main() -> None:
                 logger.warning("Login reconcile fetch failed: discord_user_id=%s error=%s", discord_user_id, exc)
         return login_ok
 
-    async def _fetch_recent_purchases_all(discord_user_id: str) -> list[BetSlip]:
-        fake_slips = _load_fake_purchases(fake_purchases_file, discord_user_id, limit=30)
+    async def _fetch_recent_purchases_all(
+        discord_user_id: str,
+        *,
+        limit: int = 30,
+        include_match_details: bool = True,
+        use_cache: bool = True,
+    ) -> list[BetSlip]:
+        normalized_limit = max(1, min(30, int(limit)))
+        fake_slips = _load_fake_purchases(fake_purchases_file, discord_user_id, limit=normalized_limit)
         if fake_slips is not None:
             logger.info("Using fake purchases for testing: discord_user_id=%s count=%d", discord_user_id, len(fake_slips))
             return fake_slips
@@ -1178,12 +1186,39 @@ async def main() -> None:
         await _begin_user_request(session)
         try:
             await _ensure_logged_in(session)
+            request_id = get_purchase_request_id() or "-"
+            if not use_cache:
+                started_at = time.monotonic()
+                page = await session.context.new_page()
+                try:
+                    slips = await scrape_purchase_history(
+                        page,
+                        limit=normalized_limit,
+                        include_match_details=include_match_details,
+                    )
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                elapsed_ms = (time.monotonic() - started_at) * 1000
+                logger.info(
+                    "purchases command list_fetch_ms=%.2f request_id=%s discord_user_id=%s limit=%d include_match_details=%s count=%d",
+                    elapsed_ms,
+                    request_id,
+                    discord_user_id,
+                    normalized_limit,
+                    include_match_details,
+                    len(slips),
+                )
+                return slips[:normalized_limit]
+
             logger.info("purchases cache check start: discord_user_id=%s", discord_user_id)
 
             async def probe_fetch() -> str:
                 page = await session.context.new_page()
                 try:
-                    return await probe_recent_purchases_token(page, limit=30)
+                    return await probe_recent_purchases_token(page, limit=normalized_limit)
                 finally:
                     try:
                         await page.close()
@@ -1193,7 +1228,11 @@ async def main() -> None:
             async def full_fetch() -> list[BetSlip]:
                 page = await session.context.new_page()
                 try:
-                    return await scrape_purchase_history(page, limit=30)
+                    return await scrape_purchase_history(
+                        page,
+                        limit=normalized_limit,
+                        include_match_details=include_match_details,
+                    )
                 finally:
                     try:
                         await page.close()
@@ -1205,8 +1244,14 @@ async def main() -> None:
             await _end_user_request(session)
 
     async def do_purchases(discord_user_id: str, count: int) -> list[BetSlip]:
-        slips = await _fetch_recent_purchases_all(discord_user_id)
-        return slips[: _normalize_purchases_count(count)]
+        requested_count = _normalize_purchases_count(count)
+        slips = await _fetch_recent_purchases_all(
+            discord_user_id,
+            limit=requested_count,
+            include_match_details=False,
+            use_cache=False,
+        )
+        return slips[:requested_count]
 
     async def do_purchases_snapshot(discord_user_id: str, target_slip_ids: list[str]) -> dict[str, object] | None:
         if not target_slip_ids:
@@ -1222,13 +1267,27 @@ async def main() -> None:
         await _begin_user_request(session)
         try:
             await _ensure_logged_in(session)
+            request_id = get_purchase_request_id() or "-"
+            started_at = time.monotonic()
             page = await session.context.new_page()
             try:
-                return await capture_purchase_paper_area_snapshots(
+                result = await capture_purchase_paper_area_snapshots(
                     page,
                     target_slip_ids,
                     discord_user_id=discord_user_id,
+                    request_id=request_id,
                 )
+                elapsed_ms = (time.monotonic() - started_at) * 1000
+                logger.info(
+                    "purchases command snapshot_total_ms=%.2f request_id=%s discord_user_id=%s target_count=%d success=%s failed=%s",
+                    elapsed_ms,
+                    request_id,
+                    discord_user_id,
+                    len(target_slip_ids),
+                    result.get("success_count"),
+                    result.get("failed_count"),
+                )
+                return result
             finally:
                 try:
                     await page.close()
