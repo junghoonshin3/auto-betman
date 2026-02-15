@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "응큼픽딱걸렸노",
+  "name": "응큼픽 딱걸렸네",
   "version": "0.2.4",
   "description": "Detect Betman purchases in real time and push ticket screenshots to Discord webhook.",
   "permissions": ["storage", "tabs", "activeTab"],
@@ -36,7 +36,7 @@
     }
   ],
   "action": {
-    "default_title": "응큼픽딱걸렸노"
+    "default_title": "응큼픽 딱걸렸네"
   },
   "options_page": "options.html"
 }

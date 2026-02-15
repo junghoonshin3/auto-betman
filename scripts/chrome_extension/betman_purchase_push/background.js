@@ -142,7 +142,7 @@ async function sendWebhookImage({ webhookUrl, dataUrl, filename, content }) {
     formData.append(
       "payload_json",
       JSON.stringify({
-        username: "응큼픽딱걸렸노",
+        username: "응큼픽 딱걸렸네",
         ...(messageContent ? { content: messageContent } : {}),
       }),
     );

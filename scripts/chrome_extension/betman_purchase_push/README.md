@@ -1,4 +1,4 @@
-# 응큼픽딱걸렸노 (Chrome Extension)
+# 응큼픽 딱걸렸네 (Chrome Extension)
 
 ## 설치
 
