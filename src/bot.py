@@ -4,13 +4,15 @@ import io
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Awaitable, Callable
 
 import discord
 from discord import app_commands
 
-from src.models import BetSlip, MatchBet, PurchaseAnalysis, SaleGamesSnapshot
+from src.models import BetSlip, GamesCaptureResult, MatchBet, PurchaseAnalysis, SaleGamesSnapshot
+from src.request_context import generate_purchase_request_id, reset_purchase_request_id, set_purchase_request_id
 
 logger = logging.getLogger(__name__)
 LOGIN_ID_MAP_PATH = Path("storage/login_id_map.json")
@@ -468,7 +470,7 @@ class Bot(discord.Client):
         self.purchase_callback: Callable[[str, int], Awaitable[list[BetSlip]]] | None = None
         self.purchase_snapshot_callback: Callable[[str, list[str]], Awaitable[dict[str, object] | None]] | None = None
         self.analysis_callback: Callable[[str, int], Awaitable[PurchaseAnalysis]] | None = None
-        self.games_callback: Callable[[str, str], Awaitable[SaleGamesSnapshot]] | None = None
+        self.games_callback: Callable[[str, str], Awaitable[GamesCaptureResult]] | None = None
         self.logout_callback: Callable[[str], Awaitable[bool]] | None = None
         self.sync_guild_id: int | None = None
 
@@ -515,86 +517,112 @@ class Bot(discord.Client):
                 return
 
             await interaction.response.defer(thinking=True)
+            request_id = generate_purchase_request_id(str(interaction.user.id))
+            request_token = set_purchase_request_id(request_id)
+            started_at = time.monotonic()
+            logger.info(
+                "purchases command start request_id=%s discord_user_id=%s count=%d",
+                request_id,
+                str(interaction.user.id),
+                int(count),
+            )
             try:
-                slips = await self.purchase_callback(str(interaction.user.id), int(count))
-            except Exception as exc:
-                logger.exception("Failed to scrape purchases")
-                await interaction.followup.send(f"구매내역 조회 실패: {exc}")
-                return
-
-            if not slips:
-                await interaction.followup.send("투표지 스크린샷을 첨부할 대상이 없습니다.")
-                return
-
-            sale_open_count = sum(1 for slip in slips if str(slip.status or "").strip() == "발매중")
-            sale_close_count = sum(1 for slip in slips if str(slip.status or "").strip() == "발매마감")
-            hit_count = sum(1 for slip in slips if str(slip.status or "").strip() == "적중" or (slip.result or "").strip() == "적중")
-            miss_count = sum(
-                1
-                for slip in slips
-                if str(slip.status or "").strip() in {"적중안됨", "미적중"} or (slip.result or "").strip() == "미적중"
-            )
-            files: list[discord.File] = []
-            target_slip_ids: list[str] = []
-            seen_target_ids: set[str] = set()
-            for slip in slips:
-                if str(slip.status or "").strip() not in {"발매중", "발매마감"}:
-                    continue
-                slip_id = str(slip.slip_id).strip()
-                if not slip_id or slip_id in seen_target_ids:
-                    continue
-                seen_target_ids.add(slip_id)
-                target_slip_ids.append(slip_id)
-
-            attempted_snapshot_count = len(target_slip_ids)
-            success_count = 0
-            failed_count = 0
-            exact_success_count = 0
-            fallback_success_count = 0
-            if self.purchase_snapshot_callback is not None:
-                discord_user_id = str(interaction.user.id)
                 try:
-                    if target_slip_ids:
-                        snapshot_result = await self.purchase_snapshot_callback(discord_user_id, target_slip_ids)
-                        result_map = snapshot_result or {}
-                        if isinstance(result_map, dict):
-                            attempted_snapshot_count = int(result_map.get("attempted_count", attempted_snapshot_count) or attempted_snapshot_count)
-                            success_count = int(result_map.get("success_count", 0) or 0)
-                            failed_count = int(result_map.get("failed_count", 0) or 0)
-                            exact_success_count = int(result_map.get("exact_success_count", 0) or 0)
-                            fallback_success_count = int(result_map.get("fallback_success_count", 0) or 0)
-                            snapshot_files = result_map.get("files") or []
-                        else:
-                            snapshot_files = result_map
-                        for filename, data in snapshot_files or []:
-                            if not data:
-                                continue
-                            safe_name = str(filename or "").strip() or f"paper_{discord_user_id}.png"
-                            files.append(discord.File(io.BytesIO(data), filename=safe_name))
-                        if success_count <= 0:
-                            success_count = len(files)
-                        if failed_count <= 0:
-                            failed_count = max(0, attempted_snapshot_count - success_count)
+                    slips = await self.purchase_callback(str(interaction.user.id), int(count))
                 except Exception as exc:
-                    logger.warning("Failed to capture purchase snapshot: discord_user_id=%s error=%s", discord_user_id, exc)
+                    logger.exception("Failed to scrape purchases")
+                    await interaction.followup.send(f"구매내역 조회 실패: {exc}")
+                    return
 
-            summary_line = (
-                f"[구매 요약] 조회 {len(slips)}건 · 발매중 {sale_open_count} · 발매마감 {sale_close_count} · "
-                f"적중/미적중 {hit_count}/{miss_count} · 첨부 {len(files)}건"
-            )
+                if not slips:
+                    await interaction.followup.send("투표지 스크린샷을 첨부할 대상이 없습니다.")
+                    logger.info(
+                        "purchases command end request_id=%s discord_user_id=%s elapsed_ms=%.2f slips=0 files=0",
+                        request_id,
+                        str(interaction.user.id),
+                        (time.monotonic() - started_at) * 1000,
+                    )
+                    return
 
-            if files:
-                chunks = _split_files_for_followup(files, _MAX_FILES_PER_MESSAGE)
-                try:
-                    first_kwargs: dict[str, object] = {"content": summary_line, "files": chunks[0]}
-                    await interaction.followup.send(**first_kwargs)
-                    for chunk in chunks[1:]:
-                        await interaction.followup.send(files=chunk)
-                except Exception as exc:
-                    logger.warning("Failed to send purchase snapshots as files: error=%s", exc)
+                sale_open_count = sum(1 for slip in slips if str(slip.status or "").strip() == "발매중")
+                sale_close_count = sum(1 for slip in slips if str(slip.status or "").strip() == "발매마감")
+                hit_count = sum(1 for slip in slips if str(slip.status or "").strip() == "적중" or (slip.result or "").strip() == "적중")
+                miss_count = sum(
+                    1
+                    for slip in slips
+                    if str(slip.status or "").strip() in {"적중안됨", "미적중"} or (slip.result or "").strip() == "미적중"
+                )
+                files: list[discord.File] = []
+                target_slip_ids: list[str] = []
+                seen_target_ids: set[str] = set()
+                for slip in slips:
+                    if str(slip.status or "").strip() not in {"발매중", "발매마감"}:
+                        continue
+                    slip_id = str(slip.slip_id).strip()
+                    if not slip_id or slip_id in seen_target_ids:
+                        continue
+                    seen_target_ids.add(slip_id)
+                    target_slip_ids.append(slip_id)
+
+                attempted_snapshot_count = len(target_slip_ids)
+                success_count = 0
+                failed_count = 0
+                exact_success_count = 0
+                fallback_success_count = 0
+                if self.purchase_snapshot_callback is not None:
+                    discord_user_id = str(interaction.user.id)
+                    try:
+                        if target_slip_ids:
+                            snapshot_result = await self.purchase_snapshot_callback(discord_user_id, target_slip_ids)
+                            result_map = snapshot_result or {}
+                            if isinstance(result_map, dict):
+                                attempted_snapshot_count = int(result_map.get("attempted_count", attempted_snapshot_count) or attempted_snapshot_count)
+                                success_count = int(result_map.get("success_count", 0) or 0)
+                                failed_count = int(result_map.get("failed_count", 0) or 0)
+                                exact_success_count = int(result_map.get("exact_success_count", 0) or 0)
+                                fallback_success_count = int(result_map.get("fallback_success_count", 0) or 0)
+                                snapshot_files = result_map.get("files") or []
+                            else:
+                                snapshot_files = result_map
+                            for filename, data in snapshot_files or []:
+                                if not data:
+                                    continue
+                                safe_name = str(filename or "").strip() or f"paper_{discord_user_id}.png"
+                                files.append(discord.File(io.BytesIO(data), filename=safe_name))
+                            if success_count <= 0:
+                                success_count = len(files)
+                            if failed_count <= 0:
+                                failed_count = max(0, attempted_snapshot_count - success_count)
+                    except Exception as exc:
+                        logger.warning("Failed to capture purchase snapshot: discord_user_id=%s error=%s", discord_user_id, exc)
+
+                summary_line = (
+                    f"[구매 요약] 조회 {len(slips)}건 · 발매중 {sale_open_count} · 발매마감 {sale_close_count} · "
+                    f"적중/미적중 {hit_count}/{miss_count} · 첨부 {len(files)}건"
+                )
+
+                if files:
+                    chunks = _split_files_for_followup(files, _MAX_FILES_PER_MESSAGE)
+                    try:
+                        first_kwargs: dict[str, object] = {"content": summary_line, "files": chunks[0]}
+                        await interaction.followup.send(**first_kwargs)
+                        for chunk in chunks[1:]:
+                            await interaction.followup.send(files=chunk)
+                    except Exception as exc:
+                        logger.warning("Failed to send purchase snapshots as files: error=%s", exc)
+                        await interaction.followup.send(content=summary_line)
+                else:
                     await interaction.followup.send(content=summary_line)
-            else:
-                await interaction.followup.send(content=summary_line)
+                logger.info(
+                    "purchases command end request_id=%s discord_user_id=%s elapsed_ms=%.2f slips=%d files=%d",
+                    request_id,
+                    str(interaction.user.id),
+                    (time.monotonic() - started_at) * 1000,
+                    len(slips),
+                    len(files),
+                )
+            finally:
+                reset_purchase_request_id(request_token)
 
         @self.tree.command(name="analysis", description="구매현황분석 조회")
         @app_commands.describe(months="조회 개월 수 (1~12, 기본 12)")
@@ -616,7 +644,7 @@ class Bot(discord.Client):
 
             await interaction.followup.send(embed=_build_analysis_embed(result))
 
-        @self.tree.command(name="games", description="발매중 전체 경기 요약 조회")
+        @self.tree.command(name="games", description="발매중 전체 경기 스크린샷 조회")
         @app_commands.describe(
             game_type="게임 타입 필터 (기본: 승부식)",
             sport="스포츠 종목 필터 (기본: 전체)",
@@ -626,7 +654,6 @@ class Bot(discord.Client):
                 app_commands.Choice(name="승부식", value="victory"),
                 app_commands.Choice(name="승무패", value="windrawlose"),
                 app_commands.Choice(name="기록식", value="record"),
-                app_commands.Choice(name="전체", value="all"),
             ],
             sport=[
                 app_commands.Choice(name="전체", value="all"),
@@ -648,8 +675,6 @@ class Bot(discord.Client):
             await interaction.response.defer(thinking=True)
             selected_type = game_type.value if game_type is not None else "victory"
             selected_sport = sport.value if sport is not None else "all"
-            selected_type_label = _GAME_TYPE_LABEL_BY_VALUE.get(selected_type, "전체")
-            selected_sport_label = _SPORT_LABEL_BY_VALUE.get(selected_sport, "전체")
             try:
                 snapshot = await self.games_callback(selected_type, selected_sport)
             except Exception as exc:
@@ -657,17 +682,21 @@ class Bot(discord.Client):
                 await interaction.followup.send(f"경기 조회 실패: {exc}")
                 return
 
-            if snapshot.total_matches <= 0:
-                await interaction.followup.send(
-                    f"조회 타입({selected_type_label}), 종목({selected_sport_label})의 발매중 경기가 없습니다."
-                )
+            files: list[discord.File] = []
+            for idx, (filename, data) in enumerate(snapshot.files, start=1):
+                if not data:
+                    continue
+                safe_name = str(filename or "").strip() or f"games_{selected_type}_{selected_sport}_{idx:02d}.jpg"
+                files.append(discord.File(io.BytesIO(data), filename=safe_name))
+
+            if not files:
+                await interaction.followup.send("경기 스크린샷을 첨부할 수 없습니다.")
                 return
 
-            embed, file_obj = _build_games_message(snapshot, selected_type_label, selected_sport_label)
-            if file_obj is not None:
-                await interaction.followup.send(embed=embed, file=file_obj)
-            else:
-                await interaction.followup.send(embed=embed)
+            chunks = _split_files_for_followup(files, _MAX_FILES_PER_MESSAGE)
+            await interaction.followup.send(files=chunks[0])
+            for chunk in chunks[1:]:
+                await interaction.followup.send(files=chunk)
 
         @self.tree.command(name="logout", description="베트맨 로그아웃")
         async def logout_command(interaction: discord.Interaction) -> None:

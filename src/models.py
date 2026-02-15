@@ -70,3 +70,13 @@ class SaleGamesSnapshot:
     sport_counts: dict[str, int]
     nearest_matches: list[SaleGameMatch]
     partial_failures: int
+
+
+@dataclass
+class GamesCaptureResult:
+    fetched_at: str
+    game_type: str
+    sport: str
+    files: list[tuple[str, bytes]]
+    captured_count: int
+    truncated: bool

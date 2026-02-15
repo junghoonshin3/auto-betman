@@ -18,9 +18,10 @@ from playwright_stealth import Stealth
 from src import auth
 from src.analysis import probe_purchase_analysis_token, scrape_purchase_analysis
 from src.bot import Bot, _build_compact_purchase_embeds
-from src.games import scrape_sale_games_summary
-from src.models import BetSlip, MatchBet, PurchaseAnalysis, SaleGameMatch, SaleGamesSnapshot
+from src.games import capture_sale_games_list_screenshots, normalize_games_capture_game_type, normalize_games_capture_sport
+from src.models import BetSlip, GamesCaptureResult, MatchBet, PurchaseAnalysis, SaleGameMatch, SaleGamesSnapshot
 from src.purchases import capture_purchase_paper_area_snapshots, probe_recent_purchases_token, scrape_purchase_history
+from src.request_context import get_purchase_request_id
 
 logger = logging.getLogger(__name__)
 SESSION_DIR = Path("storage")
@@ -1063,9 +1064,8 @@ async def main() -> None:
     user_sessions: dict[str, UserSession] = {}
     creating_sessions: dict[str, asyncio.Task[UserSession]] = {}
     sessions_lock = asyncio.Lock()
-    games_cache: SaleGamesSnapshot | None = None
-    games_cache_at_monotonic: float | None = None
-    games_refresh_task: asyncio.Task[SaleGamesSnapshot] | None = None
+    games_cache_by_filter: dict[tuple[str, str], tuple[GamesCaptureResult, float]] = {}
+    games_refresh_task_by_filter: dict[tuple[str, str], asyncio.Task[GamesCaptureResult]] = {}
     games_lock = asyncio.Lock()
     auto_notify_state = AutoNotifyState()
     auto_notify_task: asyncio.Task[None] | None = None
@@ -1168,8 +1168,15 @@ async def main() -> None:
                 logger.warning("Login reconcile fetch failed: discord_user_id=%s error=%s", discord_user_id, exc)
         return login_ok
 
-    async def _fetch_recent_purchases_all(discord_user_id: str) -> list[BetSlip]:
-        fake_slips = _load_fake_purchases(fake_purchases_file, discord_user_id, limit=30)
+    async def _fetch_recent_purchases_all(
+        discord_user_id: str,
+        *,
+        limit: int = 30,
+        include_match_details: bool = True,
+        use_cache: bool = True,
+    ) -> list[BetSlip]:
+        normalized_limit = max(1, min(30, int(limit)))
+        fake_slips = _load_fake_purchases(fake_purchases_file, discord_user_id, limit=normalized_limit)
         if fake_slips is not None:
             logger.info("Using fake purchases for testing: discord_user_id=%s count=%d", discord_user_id, len(fake_slips))
             return fake_slips
@@ -1178,12 +1185,39 @@ async def main() -> None:
         await _begin_user_request(session)
         try:
             await _ensure_logged_in(session)
+            request_id = get_purchase_request_id() or "-"
+            if not use_cache:
+                started_at = time.monotonic()
+                page = await session.context.new_page()
+                try:
+                    slips = await scrape_purchase_history(
+                        page,
+                        limit=normalized_limit,
+                        include_match_details=include_match_details,
+                    )
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                elapsed_ms = (time.monotonic() - started_at) * 1000
+                logger.info(
+                    "purchases command list_fetch_ms=%.2f request_id=%s discord_user_id=%s limit=%d include_match_details=%s count=%d",
+                    elapsed_ms,
+                    request_id,
+                    discord_user_id,
+                    normalized_limit,
+                    include_match_details,
+                    len(slips),
+                )
+                return slips[:normalized_limit]
+
             logger.info("purchases cache check start: discord_user_id=%s", discord_user_id)
 
             async def probe_fetch() -> str:
                 page = await session.context.new_page()
                 try:
-                    return await probe_recent_purchases_token(page, limit=30)
+                    return await probe_recent_purchases_token(page, limit=normalized_limit)
                 finally:
                     try:
                         await page.close()
@@ -1193,7 +1227,11 @@ async def main() -> None:
             async def full_fetch() -> list[BetSlip]:
                 page = await session.context.new_page()
                 try:
-                    return await scrape_purchase_history(page, limit=30)
+                    return await scrape_purchase_history(
+                        page,
+                        limit=normalized_limit,
+                        include_match_details=include_match_details,
+                    )
                 finally:
                     try:
                         await page.close()
@@ -1205,8 +1243,14 @@ async def main() -> None:
             await _end_user_request(session)
 
     async def do_purchases(discord_user_id: str, count: int) -> list[BetSlip]:
-        slips = await _fetch_recent_purchases_all(discord_user_id)
-        return slips[: _normalize_purchases_count(count)]
+        requested_count = _normalize_purchases_count(count)
+        slips = await _fetch_recent_purchases_all(
+            discord_user_id,
+            limit=requested_count,
+            include_match_details=False,
+            use_cache=False,
+        )
+        return slips[:requested_count]
 
     async def do_purchases_snapshot(discord_user_id: str, target_slip_ids: list[str]) -> dict[str, object] | None:
         if not target_slip_ids:
@@ -1222,13 +1266,27 @@ async def main() -> None:
         await _begin_user_request(session)
         try:
             await _ensure_logged_in(session)
+            request_id = get_purchase_request_id() or "-"
+            started_at = time.monotonic()
             page = await session.context.new_page()
             try:
-                return await capture_purchase_paper_area_snapshots(
+                result = await capture_purchase_paper_area_snapshots(
                     page,
                     target_slip_ids,
                     discord_user_id=discord_user_id,
+                    request_id=request_id,
                 )
+                elapsed_ms = (time.monotonic() - started_at) * 1000
+                logger.info(
+                    "purchases command snapshot_total_ms=%.2f request_id=%s discord_user_id=%s target_count=%d success=%s failed=%s",
+                    elapsed_ms,
+                    request_id,
+                    discord_user_id,
+                    len(target_slip_ids),
+                    result.get("success_count"),
+                    result.get("failed_count"),
+                )
+                return result
             finally:
                 try:
                     await page.close()
@@ -1313,25 +1371,36 @@ async def main() -> None:
             logger.exception("Logout failed: discord_user_id=%s error=%s", discord_user_id, exc)
             return False
 
-    async def do_games(game_type: str, sport: str) -> SaleGamesSnapshot:
-        nonlocal games_cache
-        nonlocal games_cache_at_monotonic
-        nonlocal games_refresh_task
-
-        normalized_type = _normalize_games_filter_value(game_type)
-        normalized_sport = _normalize_games_sport_filter_value(sport)
+    async def do_games(game_type: str, sport: str) -> GamesCaptureResult:
+        normalized_type = normalize_games_capture_game_type(game_type)
+        normalized_sport = normalize_games_capture_sport(sport)
+        cache_key = (normalized_type, normalized_sport)
+        logger.info(
+            "games capture source=public no_login_required type=%s sport=%s",
+            normalized_type,
+            normalized_sport,
+        )
 
         now = time.monotonic()
-        task: asyncio.Task[SaleGamesSnapshot]
+        task: asyncio.Task[GamesCaptureResult]
         async with games_lock:
-            if games_cache is not None and games_cache_at_monotonic is not None:
-                age = now - games_cache_at_monotonic
+            cached_entry = games_cache_by_filter.get(cache_key)
+            if cached_entry is not None:
+                cached_result, cached_at = cached_entry
+                age = now - cached_at
                 if age <= CACHE_TTL_SECONDS:
-                    logger.info("games cache hit: type=%s sport=%s age=%.2fs", normalized_type, normalized_sport, age)
-                    return _filter_sale_games_snapshot(games_cache, normalized_type, normalized_sport)
+                    logger.info(
+                        "games capture cache hit: type=%s sport=%s age=%.2fs",
+                        normalized_type,
+                        normalized_sport,
+                        age,
+                    )
+                    return cached_result
 
-            if games_refresh_task is None or games_refresh_task.done():
-                async def refresh_games() -> SaleGamesSnapshot:
+            existing_task = games_refresh_task_by_filter.get(cache_key)
+            if existing_task is None or existing_task.done():
+
+                async def refresh_games() -> GamesCaptureResult:
                     context = await browser.new_context(
                         user_agent=(
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1343,7 +1412,12 @@ async def main() -> None:
                     try:
                         await stealth.apply_stealth_async(context)
                         page = await context.new_page()
-                        return await scrape_sale_games_summary(page, nearest_limit=None)
+                        return await capture_sale_games_list_screenshots(
+                            page,
+                            normalized_type,
+                            normalized_sport,
+                            max_images=30,
+                        )
                     finally:
                         if page is not None:
                             try:
@@ -1355,38 +1429,55 @@ async def main() -> None:
                         except Exception:
                             pass
 
-                games_refresh_task = asyncio.create_task(refresh_games())
-                logger.info("games refresh task created")
+                task = asyncio.create_task(refresh_games())
+                games_refresh_task_by_filter[cache_key] = task
+                logger.info("games capture refresh task created: type=%s sport=%s", normalized_type, normalized_sport)
             else:
-                logger.info("games refresh task joined")
-            task = games_refresh_task
+                task = existing_task
+                logger.info("games capture refresh task joined: type=%s sport=%s", normalized_type, normalized_sport)
 
         try:
-            snapshot = await task
+            result = await task
+            logger.info(
+                "games capture completed: type=%s sport=%s captured_files=%d truncated=%s",
+                normalized_type,
+                normalized_sport,
+                result.captured_count,
+                result.truncated,
+            )
             async with games_lock:
-                games_cache = snapshot
-                games_cache_at_monotonic = time.monotonic()
-                if games_refresh_task is task:
-                    games_refresh_task = None
-            return _filter_sale_games_snapshot(snapshot, normalized_type, normalized_sport)
+                games_cache_by_filter[cache_key] = (result, time.monotonic())
+                current_task = games_refresh_task_by_filter.get(cache_key)
+                if current_task is task:
+                    games_refresh_task_by_filter.pop(cache_key, None)
+            return result
         except Exception as exc:
             async with games_lock:
-                if games_refresh_task is task:
-                    games_refresh_task = None
-                stale = games_cache
-                stale_age = (
-                    time.monotonic() - games_cache_at_monotonic
-                    if stale is not None and games_cache_at_monotonic is not None
-                    else None
-                )
+                current_task = games_refresh_task_by_filter.get(cache_key)
+                if current_task is task:
+                    games_refresh_task_by_filter.pop(cache_key, None)
+                stale_entry = games_cache_by_filter.get(cache_key)
+
+            stale_result: GamesCaptureResult | None = None
+            stale_age: float | None = None
+            if stale_entry is not None:
+                stale_result, stale_at = stale_entry
+                stale_age = time.monotonic() - stale_at
+
             if (
-                stale is not None
+                stale_result is not None
                 and stale_age is not None
                 and stale_age <= CACHE_MAX_STALE_SECONDS
                 and _should_use_stale_cache_on_error(exc)
             ):
-                logger.warning("games stale cache used due to transient error: age=%.2fs error=%s", stale_age, exc)
-                return _filter_sale_games_snapshot(stale, normalized_type, normalized_sport)
+                logger.warning(
+                    "games capture stale cache used due to transient error: type=%s sport=%s age=%.2fs error=%s",
+                    normalized_type,
+                    normalized_sport,
+                    stale_age,
+                    exc,
+                )
+                return stale_result
             raise
 
     bot.login_callback = do_login
@@ -1426,9 +1517,11 @@ async def main() -> None:
             if not task.done():
                 task.cancel()
         async with games_lock:
-            refresh_task = games_refresh_task
-            games_refresh_task = None
-        if refresh_task is not None and not refresh_task.done():
+            refresh_tasks = list(games_refresh_task_by_filter.values())
+            games_refresh_task_by_filter.clear()
+        for refresh_task in refresh_tasks:
+            if refresh_task is None or refresh_task.done():
+                continue
             refresh_task.cancel()
             try:
                 await refresh_task
