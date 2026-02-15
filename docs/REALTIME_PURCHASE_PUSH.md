@@ -22,15 +22,15 @@
 
 1. Chrome/Edge
 2. Discord Webhook URL
-3. 확장 경로
-- `/Users/junghoon/.codex/worktrees/b995/auto_betman/scripts/chrome_extension/betman_purchase_push`
+3. 확장 저장소
+- `https://github.com/junghoonshin3/betman-purchase-push-extension`
 
 ## 3) 설치/설정
 
 1. `chrome://extensions` 열기
 2. 개발자 모드 ON
 3. `압축해제된 확장 프로그램을 로드합니다`
-4. 확장 폴더 선택
+4. `betman-purchase-push-extension` 저장소를 clone/download 받은 폴더 선택
 5. 옵션에서 Webhook URL 저장
 6. 확장 Reload + Betman 탭 강력 새로고침
 
